@@ -369,12 +369,18 @@ def main():
     parser_animate.add_argument("filename_pattern", type=str, help="Image files, via glob pattern")
     parser_animate.add_argument("--fps", type=int, default=30, help="FPS of the output video")
 
+    subparsers.add_parser("setup", help="Open the GPU Setup & Configuration GUI")
+
     args = parser.parse_args()
 
     if args.command == "view":
         view(args.filename, args.collision, args.rotate, args.scale, args.link_frame)
     elif args.command == "animate":
         animate(args.filename_pattern, args.fps)
+    elif args.command == "setup":
+        from genesis.tools.gpu_setup_gui import main as setup_main
+
+        setup_main()
     elif args.command is None:
         parser.print_help()
 

@@ -127,6 +127,7 @@ usd = [
 
 [project.scripts]
 gs = "genesis._main:main"
+gs-setup = "genesis.tools.gpu_setup_gui:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
