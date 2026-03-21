@@ -1,5 +1,4 @@
 import argparse
-import time
 
 import numpy as np
 import torch
@@ -8,14 +7,13 @@ import genesis as gs
 
 
 def main():
-
     parser = argparse.ArgumentParser()
-    parser.add_argument("-v", "--vis", action="store_true", default=True)
+    parser.add_argument("-v", "--vis", action="store_true", default=False)
     parser.add_argument("-c", "--cpu", action="store_true", default=False)
     args = parser.parse_args()
 
     ########################## init ##########################
-    gs.init(seed=0, backend=gs.cpu if args.cpu else gs.gpu)
+    gs.init(backend=gs.cpu if args.cpu else gs.gpu)
 
     ########################## create a scene ##########################
 
@@ -25,14 +23,11 @@ def main():
             camera_lookat=(5.0, 5.0, 0.0),
             camera_fov=40,
         ),
-        show_viewer=args.vis,
         rigid_options=gs.options.RigidOptions(
             dt=0.01,
             constraint_solver=gs.constraint_solver.Newton,
         ),
-        vis_options=gs.options.VisOptions(
-            # geom_type='sdf',
-        ),
+        show_viewer=args.vis,
     )
 
     horizontal_scale = 0.25
@@ -46,24 +41,23 @@ def main():
             horizontal_scale=horizontal_scale,
             vertical_scale=vertical_scale,
             height_field=height_field,
+            name="example",
+            # from_stored=True,
         ),
     )
     ########################## build ##########################
     scene.build(n_envs=1)
 
     height_field = terrain.geoms[0].metadata["height_field"]
-    rows = horizontal_scale * torch.arange(0, height_field.shape[0], 1, device="cuda").unsqueeze(1).repeat(
-        1, height_field.shape[1]
-    ).unsqueeze(-1)
-    cols = horizontal_scale * torch.arange(0, height_field.shape[1], 1, device="cuda").unsqueeze(0).repeat(
-        height_field.shape[0], 1
-    ).unsqueeze(-1)
-    heights = vertical_scale * torch.tensor(height_field, device="cuda").unsqueeze(-1)
+    rows = horizontal_scale * torch.arange(0, height_field.shape[0], 1, dtype=gs.tc_float, device=gs.device)
+    rows = rows.unsqueeze(1).repeat((1, height_field.shape[1]))
+    cols = horizontal_scale * torch.arange(0, height_field.shape[1], 1, dtype=gs.tc_float, device=gs.device)
+    cols = cols.unsqueeze(0).repeat((height_field.shape[0], 1))
+    heights = vertical_scale * torch.tensor(height_field, dtype=gs.tc_float, device=gs.device)
 
-    poss = torch.cat([rows, cols, heights], dim=-1).reshape(-1, 3)
+    poss = torch.stack([rows, cols, heights], dim=-1).reshape((-1, 3))
     scene.draw_debug_spheres(poss=poss, radius=0.05, color=(0, 0, 1, 0.7))
     for _ in range(1000):
-        time.sleep(0.5)
         scene.step()
 
 

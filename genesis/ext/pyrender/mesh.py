@@ -7,8 +7,7 @@ Author: Matthew Matl
 import copy
 
 import numpy as np
-
-from genesis.ext import trimesh
+import trimesh
 
 from .constants import GLTF
 from .material import MetallicRoughnessMaterial
@@ -30,11 +29,12 @@ class Mesh(object):
         If False, the mesh will not be rendered.
     """
 
-    def __init__(self, primitives, name=None, weights=None, is_visible=True):
+    def __init__(self, primitives, name=None, weights=None, is_visible=True, is_marker=False):
         self.primitives = primitives
         self.name = name
         self.weights = weights
         self.is_visible = is_visible
+        self.is_marker = is_marker
 
         self._bounds = None
 
@@ -50,43 +50,23 @@ class Mesh(object):
         self._name = value
 
     @property
-    def primitives(self):
-        """list of :class:`Primitive` : The primitives associated
-        with this mesh.
-        """
-        return self._primitives
-
-    @primitives.setter
-    def primitives(self, value):
-        self._primitives = value
-
-    @property
-    def weights(self):
-        """(k,) float : Weights to be applied to morph targets."""
-        return self._weights
-
-    @weights.setter
-    def weights(self, value):
-        self._weights = value
-
-    @property
-    def is_visible(self):
-        """bool : Whether the mesh is visible."""
-        return self._is_visible
-
-    @is_visible.setter
-    def is_visible(self, value):
-        self._is_visible = value
-
-    @property
     def bounds(self):
         """(2,3) float : The axis-aligned bounds of the mesh."""
         if self._bounds is None:
-            bounds = np.array([[np.infty, np.infty, np.infty], [-np.infty, -np.infty, -np.infty]])
-            for p in self.primitives:
-                bounds[0] = np.minimum(bounds[0], p.bounds[0])
-                bounds[1] = np.maximum(bounds[1], p.bounds[1])
-            self._bounds = bounds
+            if self.primitives:
+                if len(self.primitives) > 1:
+                    self._bounds = np.stack(
+                        (
+                            np.min([p.bounds[0] for p in self.primitives], axis=0),
+                            np.max([p.bounds[1] for p in self.primitives], axis=0),
+                        ),
+                        axis=0,
+                    )
+                else:
+                    # In the vast majority of scenarios there is a single primitive
+                    self._bounds = self.primitives[0].bounds
+            else:
+                self._bounds = np.zeros((2, 3))
         return self._bounds
 
     @property
@@ -99,12 +79,12 @@ class Mesh(object):
     @property
     def extents(self):
         """(3,) float : The lengths of the axes of the mesh's AABB."""
-        return np.diff(self.bounds, axis=0).reshape(-1)
+        return self.bounds[1] - self.bounds[0]
 
     @property
     def scale(self):
         """(3,) float : The length of the diagonal of the mesh's AABB."""
-        return np.linalg.norm(self.extents)
+        return max(np.linalg.norm(self.extents), 1e-7)
 
     @property
     def is_transparent(self):
@@ -115,13 +95,15 @@ class Mesh(object):
         return False
 
     @staticmethod
-    def from_points(points, colors=None, normals=None, is_visible=True, poses=None):
+    def from_points(points, name=None, colors=None, normals=None, is_visible=True, poses=None, is_marker=False):
         """Create a Mesh from a set of points.
 
         Parameters
         ----------
         points : (n,3) float
             The point positions.
+        name : str
+            The user-defined name of this object.
         colors : (n,3) or (n,4) float, optional
             RGB or RGBA colors for each point.
         normals : (n,3) float, optionals
@@ -137,19 +119,22 @@ class Mesh(object):
             The created mesh.
         """
         primitive = Primitive(positions=points, normals=normals, color_0=colors, mode=GLTF.POINTS, poses=poses)
-        mesh = Mesh(primitives=[primitive], is_visible=is_visible)
+        mesh = Mesh(primitives=[primitive], name=name, is_visible=is_visible, is_marker=is_marker)
         return mesh
 
     @staticmethod
     def from_trimesh(
         mesh,
+        name=None,
         material=None,
         is_visible=True,
+        is_marker=False,
         poses=None,
         wireframe=False,
         smooth=False,
         double_sided=False,
         is_floor=False,
+        env_shared=True,
     ):
         """Create a Mesh from a :class:`~trimesh.base.Trimesh`.
 
@@ -157,12 +142,14 @@ class Mesh(object):
         ----------
         mesh : :class:`~trimesh.base.Trimesh` or list of them
             A triangular mesh or a list of meshes.
+        name : str
+            The user-defined name of this object.
         material : :class:`Material`
             The material of the object. Overrides any mesh material.
             If not specified and the mesh has no material, a default material
             will be used.
         is_visible : bool
-            If False, the mesh will not be rendered.
+            If `False`, the mesh will not be rendered.
         poses : (n,4,4) float
             Array of 4x4 transformation matrices for instancing this object.
         wireframe : bool
@@ -231,10 +218,11 @@ class Mesh(object):
                     vertex_mapping=vertex_mapping,
                     double_sided=double_sided,
                     is_floor=is_floor,
+                    env_shared=env_shared,
                 )
             )
 
-        return Mesh(primitives=primitives, is_visible=is_visible)
+        return Mesh(primitives=primitives, name=name, is_visible=is_visible, is_marker=is_marker)
 
     @staticmethod
     def _get_trimesh_props(mesh, smooth=False, material=None):
@@ -260,7 +248,10 @@ class Mesh(object):
                     else:
                         colors = vc[mesh.faces].reshape((3 * len(mesh.faces), vc.shape[1]))
                 material = MetallicRoughnessMaterial(
-                    alphaMode="BLEND", baseColorFactor=[1.0, 1.0, 1.0, 1.0], metallicFactor=0.2, roughnessFactor=0.8
+                    alphaMode="OPAQUE" if colors.shape[-1] < 4 or (colors[..., 3] == 255).all() else "BLEND",
+                    baseColorFactor=[1.0, 1.0, 1.0, 1.0],
+                    metallicFactor=0.2,
+                    roughnessFactor=0.8,
                 )
             # Process face colors
             elif mesh.visual.kind == "face":
@@ -268,15 +259,17 @@ class Mesh(object):
                     raise ValueError("Cannot use face colors with a smooth mesh")
                 else:
                     colors = np.repeat(mesh.visual.face_colors, 3, axis=0)
-
                 material = MetallicRoughnessMaterial(
-                    alphaMode="BLEND", baseColorFactor=[1.0, 1.0, 1.0, 1.0], metallicFactor=0.2, roughnessFactor=0.8
+                    alphaMode="OPAQUE" if colors.shape[-1] < 4 or (colors[..., 3] == 255).all() else "BLEND",
+                    baseColorFactor=[1.0, 1.0, 1.0, 1.0],
+                    metallicFactor=0.2,
+                    roughnessFactor=0.8,
                 )
 
         # Process texture colors
         if mesh.visual.kind == "texture":
             # Configure UV coordinates
-            if mesh.visual.uv is not None:
+            if isinstance(mesh.visual, trimesh.visual.texture.TextureVisuals) and mesh.visual.uv is not None:
                 uv = mesh.visual.uv.copy()
                 if smooth:
                     texcoords = uv
@@ -308,7 +301,7 @@ class Mesh(object):
                         glossiness = float(glossiness[0])
                     roughness = (2 / (glossiness + 2)) ** (1.0 / 4.0)
                     material = MetallicRoughnessMaterial(
-                        alphaMode="BLEND",
+                        alphaMode="OPAQUE" if (np.asarray(mat.image.convert("RGBA"))[..., 3] == 255).all() else "BLEND",
                         roughnessFactor=roughness,
                         # NOTE: most assets seems to have incorrect mat.diffuse when texture image exists, So let's just use white for baseColorFactor
                         # baseColorFactor=np.array([255, 255, 255, 255], dtype=np.uint8) if mat.image is not None else mat.diffuse,

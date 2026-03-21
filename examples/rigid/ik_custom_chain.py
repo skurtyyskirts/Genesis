@@ -11,7 +11,7 @@ def main():
     args = parser.parse_args()
 
     ########################## init ##########################
-    gs.init(seed=0, precision="32", logging_level="debug")
+    gs.init(precision="32", logging_level="info")
 
     ########################## create a scene ##########################
     scene = gs.Scene(
@@ -20,12 +20,12 @@ def main():
             camera_lookat=(0.0, 0.0, 0.5),
             camera_fov=40,
         ),
-        show_viewer=args.vis,
         rigid_options=gs.options.RigidOptions(
             gravity=(0, 0, 0),
             enable_collision=False,
             enable_joint_limit=False,
         ),
+        show_viewer=args.vis,
     )
 
     target_1 = scene.add_entity(
@@ -53,25 +53,20 @@ def main():
     index_finger_distal = robot.get_link("index_finger_distal")
 
     dofs_idx_local = []
-    for v in robot.joints:
-        if v.name in [
+    for joint in robot.joints:
+        if joint.name in (
             "wrist_joint",
             "index_finger_joint1",
-            "index_finger_join2",
+            "index_finger_joint2",
             "index_finger_joint3",
-        ]:
-            dof_idx_local_v = v.dof_idx_local
-            if isinstance(dof_idx_local_v, list):
-                dofs_idx_local.extend(dof_idx_local_v)
-            else:
-                assert isinstance(dof_idx_local_v, int)
-                dofs_idx_local.append(dof_idx_local_v)
+        ):
+            dofs_idx_local += joint.dofs_idx_local
 
     center = np.array([0.033, -0.01, 0.42])
     r1 = 0.05
 
-    for i in range(2000):
-        index_finger_pos = center + np.array([0, np.cos(i / 90 * np.pi) - 1.0, np.sin(i / 90 * np.pi) - 1.0]) * r1
+    for i in range(200):
+        index_finger_pos = center + np.array([0.0, np.cos(i / 90 * np.pi) - 1.0, np.sin(i / 90 * np.pi) - 1.0]) * r1
 
         target_1.set_qpos(np.concatenate([index_finger_pos, target_quat]))
 

@@ -1,26 +1,16 @@
 import copy
-import io
 import os
 import time
+import xml.etree.ElementTree as ET
 from collections import OrderedDict
 from typing import List
 
 import networkx as nx
 import numpy as np
 import PIL
-import six
-from lxml import etree as ET
-from scipy.spatial.transform import Rotation
+import trimesh
 
-from genesis.ext import trimesh
-
-from .utils import (
-    configure_origin,
-    get_filename,
-    load_meshes,
-    parse_origin,
-    unparse_origin,
-)
+from .utils import configure_origin, get_filename, load_meshes, parse_origin, unparse_origin
 
 
 class URDFType(object):
@@ -81,7 +71,7 @@ class URDFType(object):
 
         Parameters
         ----------
-        node : :class:`lxml.etree.Element`
+        node : :class:`xml.etree.ElementTree.Element`
             The node to parse attributes for.
 
         Returns
@@ -99,7 +89,7 @@ class URDFType(object):
                     v = cls._parse_attrib(t, node.attrib[a])
                 except Exception:
                     raise ValueError(
-                        "Missing required attribute {} when parsing an object " "of type {}".format(a, cls.__name__)
+                        "Missing required attribute {} when parsing an object of type {}".format(a, cls.__name__)
                     )
             else:
                 v = None
@@ -109,14 +99,18 @@ class URDFType(object):
         return kwargs
 
     @classmethod
-    def _parse_simple_elements(cls, node, path):
+    def _parse_simple_elements(cls, node, root, path):
         """Parse all elements in the _ELEMENTS array from the children of
         this node.
 
         Parameters
         ----------
-        node : :class:`lxml.etree.Element`
+        node : :class:`xml.etree.ElementTree.Element`
             The node to parse children for.
+        node : :class:`xml.etree.ElementTree.Element`
+            The root node of the xml URDF file to parse, in case the parsing
+            logics of a given node depends on its ancestors. Unlike `lxml`,
+            the standard module `xml` does not track parents at node-level.
         path : str
             The string path where the XML file is located (used for resolving
             the location of mesh or image files).
@@ -133,27 +127,32 @@ class URDFType(object):
             if not m:
                 v = node.find(t._TAG)
                 if r or v is not None:
-                    v = t._from_xml(v, path)
+                    v = t._from_xml(v, root, path)
             else:
                 vs = node.findall(t._TAG)
                 if len(vs) == 0 and r:
                     raise ValueError(
-                        "Missing required subelement(s) of type {} when "
-                        "parsing an object of type {}".format(t.__name__, cls.__name__)
+                        "Missing required subelement(s) of type {} when parsing an object of type {}".format(
+                            t.__name__, cls.__name__
+                        )
                     )
-                v = [t._from_xml(n, path) for n in vs]
+                v = [t._from_xml(n, node, path) for n in vs]
             kwargs[a] = v
         return kwargs
 
     @classmethod
-    def _parse(cls, node, path):
+    def _parse(cls, node, root, path):
         """Parse all elements and attributes in the _ELEMENTS and _ATTRIBS
         arrays for a node.
 
         Parameters
         ----------
-        node : :class:`lxml.etree.Element`
+        node : :class:`xml.etree.ElementTree.Element`
             The node to parse.
+        node : :class:`xml.etree.ElementTree.Element`
+            The root node of the xml URDF file to parse, in case the parsing
+            logics of a given node depends on its ancestors. Unlike `lxml`,
+            the standard module `xml` does not track parents at node-level.
         path : str
             The string path where the XML file is located (used for resolving
             the location of mesh or image files).
@@ -165,17 +164,21 @@ class URDFType(object):
             and elements in the class arrays.
         """
         kwargs = cls._parse_simple_attribs(node)
-        kwargs.update(cls._parse_simple_elements(node, path))
+        kwargs.update(cls._parse_simple_elements(node, root, path))
         return kwargs
 
     @classmethod
-    def _from_xml(cls, node, path):
+    def _from_xml(cls, node, root, path):
         """Create an instance of this class from an XML node.
 
         Parameters
         ----------
-        node : :class:`lxml.etree.Element`
+        node : :class:`xml.etree.ElementTree.Element`
             The node to parse.
+        node : :class:`xml.etree.ElementTree.Element`
+            The root node of the xml URDF file to parse, in case the parsing
+            logics of a given node depends on its ancestors. Unlike `lxml`,
+            the standard module `xml` does not track parents at node-level.
         path : str
             The string path where the XML file is located (used for resolving
             the location of mesh or image files).
@@ -185,7 +188,7 @@ class URDFType(object):
         obj : :class:`URDFType`
             An instance of this class parsed from the node.
         """
-        return cls(**cls._parse(node, path))
+        return cls(**cls._parse(node, root, path))
 
     def _unparse_attrib(self, val_type, val):
         """Convert a Python value into a string for storage in an
@@ -260,7 +263,7 @@ class URDFType(object):
 
         Returns
         -------
-        node : :class:`lxml.etree.Element`
+        node : :class:`xml.etree.ElementTree.Element`
             The newly-created node.
         """
         node = ET.Element(self._TAG)
@@ -273,7 +276,7 @@ class URDFType(object):
 
         Parameters
         ----------
-        parent : :class:`lxml.etree.Element`
+        parent : :class:`xml.etree.ElementTree.Element`
             The parent node that this element will eventually be added to.
             This base implementation doesn't use this information, but
             classes that override this function may use it.
@@ -283,7 +286,7 @@ class URDFType(object):
 
         Returns
         -------
-        node : :class:`lxml.etree.Element`
+        node : :class:`xml.etree.ElementTree.Element`
             The newly-created node.
         """
         return self._unparse(path)
@@ -317,7 +320,7 @@ class Box(URDFType):
 
     @size.setter
     def size(self, value):
-        self._size = np.asanyarray(value).astype(np.float64)
+        self._size = np.asanyarray(value, dtype=np.float64)
         self._meshes = []
 
     @property
@@ -431,6 +434,87 @@ class Cylinder(URDFType):
         return c
 
 
+class Capsule(URDFType):
+    """A capsule whose center is at the local origin.
+
+    Parameters
+    ----------
+    radius : float
+        The radius of the capsule in meters.
+    length : float
+        The length of the capsule in meters.
+    """
+
+    _ATTRIBS = {
+        "radius": (float, True),
+        "length": (float, True),
+    }
+    _TAG = "capsule"
+
+    def __init__(self, radius, length):
+        self.radius = radius
+        self.length = length
+        self._meshes = []
+
+    @property
+    def radius(self):
+        """float : The radius of the capsule in meters."""
+        return self._radius
+
+    @radius.setter
+    def radius(self, value):
+        self._radius = float(value)
+        self._meshes = []
+
+    @property
+    def length(self):
+        """float : The length of the capsule in meters."""
+        return self._length
+
+    @length.setter
+    def length(self, value):
+        self._length = float(value)
+        self._meshes = []
+
+    @property
+    def meshes(self):
+        """list of :class:`~trimesh.base.Trimesh` : The triangular meshes
+        that represent this object.
+        """
+        if len(self._meshes) == 0:
+            self._meshes = [trimesh.creation.capsule(radius=self.radius, height=self.length)]
+        return self._meshes
+
+    def copy(self, prefix="", scale=None):
+        """Create a deep copy with the prefix applied to all names.
+
+        Parameters
+        ----------
+        prefix : str
+            A prefix to apply to all names.
+
+        Returns
+        -------
+        :class:`.Capsule`
+            A deep copy.
+        """
+        if scale is None:
+            scale = 1.0
+        if isinstance(scale, (list, np.ndarray)):
+            if scale[0] != scale[1]:
+                raise ValueError("Cannot rescale capsule geometry with asymmetry in x/y")
+            c = Capsule(
+                radius=self.radius * scale[0],
+                length=self.length * scale[2],
+            )
+        else:
+            c = Capsule(
+                radius=self.radius * scale,
+                length=self.length * scale,
+            )
+        return c
+
+
 class Sphere(URDFType):
     """A sphere whose center is at the local origin.
 
@@ -538,7 +622,7 @@ class Mesh(URDFType):
     @scale.setter
     def scale(self, value):
         if value is not None:
-            value = np.asanyarray(value).astype(np.float64)
+            value = np.asanyarray(value, dtype=np.float64)
         self._scale = value
 
     @property
@@ -550,7 +634,7 @@ class Mesh(URDFType):
 
     @meshes.setter
     def meshes(self, value):
-        if isinstance(value, six.string_types):
+        if isinstance(value, str):
             value = load_meshes(value)
         elif isinstance(value, (list, tuple, set, np.ndarray)):
             value = list(value)
@@ -558,7 +642,7 @@ class Mesh(URDFType):
                 raise ValueError("Mesh must have at least one trimesh.Trimesh")
             for m in value:
                 if not isinstance(m, trimesh.Trimesh):
-                    raise TypeError("Mesh requires a trimesh.Trimesh or a " "list of them")
+                    raise TypeError("Mesh requires a trimesh.Trimesh or a list of them")
         elif isinstance(value, trimesh.Trimesh):
             value = [value]
         else:
@@ -566,13 +650,17 @@ class Mesh(URDFType):
         self._meshes = value
 
     @classmethod
-    def _from_xml(cls, node, path):
-        kwargs = cls._parse(node, path)
+    def _from_xml(cls, node, root, path):
+        kwargs = cls._parse(node, root, path)
 
         # Load the mesh, combining collision geometry meshes but keeping
         # visual ones separate to preserve colors and textures
         fn = get_filename(path, kwargs["filename"])
-        combine = node.getparent().getparent().tag == Collision._TAG
+        parent = next((p for p in root.iter() if node in p))
+        grandparent = next((p for p in root.iter() if parent in p))
+        assert grandparent.tag in (Visual._TAG, Collision._TAG)
+        combine = grandparent.tag == Collision._TAG
+
         meshes = load_meshes(fn)
         if combine:
             # Delete visuals for simplicity
@@ -584,16 +672,16 @@ class Mesh(URDFType):
         return Mesh(**kwargs)
 
     def _to_xml(self, parent, path):
-        # Get the filename
-        fn = get_filename(path, self.filename, makedirs=True)
+        # Make sure that parent directory exists
+        get_filename(path, self.filename, makedirs=True)
 
         # Export the meshes as a single file
-        meshes = self.meshes
-        if len(meshes) == 1:
-            meshes = meshes[0]
-        elif os.path.splitext(fn)[1] == ".glb":
-            meshes = trimesh.scene.Scene(geometry=meshes)
-        trimesh.exchange.export.export_mesh(meshes, fn)
+        # meshes = self.meshes
+        # if len(meshes) == 1:
+        #     meshes = meshes[0]
+        # elif os.path.splitext(fn)[1] == ".glb":
+        #     meshes = trimesh.scene.Scene(geometry=meshes)
+        # trimesh.exchange.export.export_mesh(meshes, fn)
 
         # Unparse the node
         node = self._unparse(path)
@@ -643,6 +731,8 @@ class Geometry(URDFType):
         Box geometry.
     cylinder : :class:`.Cylinder`
         Cylindrical geometry.
+    capsule : :class:`.Capsule`
+        Capsule geometry.
     sphere : :class:`.Sphere`
         Spherical geometry.
     mesh : :class:`.Mesh`
@@ -652,16 +742,18 @@ class Geometry(URDFType):
     _ELEMENTS = {
         "box": (Box, False, False),
         "cylinder": (Cylinder, False, False),
+        "capsule": (Capsule, False, False),
         "sphere": (Sphere, False, False),
         "mesh": (Mesh, False, False),
     }
     _TAG = "geometry"
 
-    def __init__(self, box=None, cylinder=None, sphere=None, mesh=None):
-        if box is None and cylinder is None and sphere is None and mesh is None:
+    def __init__(self, box=None, cylinder=None, capsule=None, sphere=None, mesh=None):
+        if box is None and cylinder is None and capsule is None and sphere is None and mesh is None:
             raise ValueError("At least one geometry element must be set")
         self.box = box
         self.cylinder = cylinder
+        self.capsule = capsule
         self.sphere = sphere
         self.mesh = mesh
 
@@ -686,6 +778,17 @@ class Geometry(URDFType):
         if value is not None and not isinstance(value, Cylinder):
             raise TypeError("Expected Cylinder type")
         self._cylinder = value
+
+    @property
+    def capsule(self):
+        """:class:`.Capsule` : Capsule geometry."""
+        return self._capsule
+
+    @capsule.setter
+    def capsule(self, value):
+        if value is not None and not isinstance(value, Capsule):
+            raise TypeError("Expected Capsule type")
+        self._capsule = value
 
     @property
     def sphere(self):
@@ -718,6 +821,8 @@ class Geometry(URDFType):
             return self.box
         if self.cylinder is not None:
             return self.cylinder
+        if self.capsule is not None:
+            return self.capsule
         if self.sphere is not None:
             return self.sphere
         if self.mesh is not None:
@@ -747,6 +852,7 @@ class Geometry(URDFType):
         v = Geometry(
             box=(self.box.copy(prefix=prefix, scale=scale) if self.box else None),
             cylinder=(self.cylinder.copy(prefix=prefix, scale=scale) if self.cylinder else None),
+            capsule=(self.capsule.copy(prefix=prefix, scale=scale) if self.capsule else None),
             sphere=(self.sphere.copy(prefix=prefix, scale=scale) if self.sphere else None),
             mesh=(self.mesh.copy(prefix=prefix, scale=scale) if self.mesh else None),
         )
@@ -796,12 +902,12 @@ class Texture(URDFType):
         if isinstance(value, np.ndarray):
             value = PIL.Image.fromarray(value)
         elif not isinstance(value, PIL.Image.Image):
-            raise ValueError("Texture only supports numpy arrays " "or PIL images")
+            raise ValueError("Texture only supports numpy arrays or PIL images")
         self._image = value
 
     @classmethod
-    def _from_xml(cls, node, path):
-        kwargs = cls._parse(node, path)
+    def _from_xml(cls, node, root, path):
+        kwargs = cls._parse(node, root, path)
 
         # Load image
         fn = get_filename(path, kwargs["filename"])
@@ -874,7 +980,7 @@ class Material(URDFType):
     @color.setter
     def color(self, value):
         if value is not None:
-            value = np.asanyarray(value).astype(np.float32)
+            value = np.asanyarray(value, dtype=np.float32)
             value = np.clip(value, 0.0, 1.0)
             if value.shape != (4,):
                 raise ValueError("Color must be a (4,) float")
@@ -888,16 +994,16 @@ class Material(URDFType):
     @texture.setter
     def texture(self, value):
         if value is not None:
-            if isinstance(value, six.string_types):
+            if isinstance(value, str):
                 image = PIL.Image.open(value)
                 value = Texture(filename=value, image=image)
             elif not isinstance(value, Texture):
-                raise ValueError("Invalid type for texture -- expect path to " "image or Texture")
+                raise ValueError("Invalid type for texture -- expect path to image or Texture")
         self._texture = value
 
     @classmethod
-    def _from_xml(cls, node, path):
-        kwargs = cls._parse(node, path)
+    def _from_xml(cls, node, root, path):
+        kwargs = cls._parse(node, root, path)
 
         # Extract the color -- it's weirdly an attribute of a subelement
         color = node.find("color")
@@ -994,12 +1100,12 @@ class Collision(URDFType):
 
     @origin.setter
     def origin(self, value):
-        self._origin = configure_origin(value)
+        self._origin = configure_origin(value, default=True)
 
     @classmethod
-    def _from_xml(cls, node, path):
-        kwargs = cls._parse(node, path)
-        kwargs["origin"] = parse_origin(node)
+    def _from_xml(cls, node, root, path):
+        kwargs = cls._parse(node, root, path)
+        kwargs["origin"] = parse_origin(node, default=True)
         return Collision(**kwargs)
 
     def _to_xml(self, parent, path):
@@ -1090,7 +1196,7 @@ class Visual(URDFType):
 
     @origin.setter
     def origin(self, value):
-        self._origin = configure_origin(value)
+        self._origin = configure_origin(value, default=True)
 
     @property
     def material(self):
@@ -1105,9 +1211,9 @@ class Visual(URDFType):
         self._material = value
 
     @classmethod
-    def _from_xml(cls, node, path):
-        kwargs = cls._parse(node, path)
-        kwargs["origin"] = parse_origin(node)
+    def _from_xml(cls, node, root, path):
+        kwargs = cls._parse(node, root, path)
+        kwargs["origin"] = parse_origin(node, default=True)
         return Visual(**kwargs)
 
     def _to_xml(self, parent, path):
@@ -1151,7 +1257,7 @@ class Inertial(URDFType):
     inertia : (3,3) float
         The 3x3 symmetric rotational inertia matrix.
     origin : (4,4) float, optional
-        The pose of the inertials relative to the link frame.
+        The pose of the inertial relative to the link frame.
         Defaults to identity if not specified.
     """
 
@@ -1169,7 +1275,7 @@ class Inertial(URDFType):
 
     @mass.setter
     def mass(self, value):
-        self._mass = float(value)
+        self._mass = float(value) if value is not None else None
 
     @property
     def inertia(self):
@@ -1178,7 +1284,7 @@ class Inertial(URDFType):
 
     @inertia.setter
     def inertia(self, value):
-        value = np.asanyarray(value).astype(np.float64)
+        value = np.asanyarray(value, dtype=np.float64)
         if not np.allclose(value, value.T):
             raise ValueError("Inertia must be a symmetric matrix")
         self._inertia = value
@@ -1190,12 +1296,12 @@ class Inertial(URDFType):
 
     @origin.setter
     def origin(self, value):
-        self._origin = configure_origin(value)
+        self._origin = configure_origin(value, default=False)
 
     @classmethod
-    def _from_xml(cls, node, path):
-        origin = parse_origin(node)
-        mass = float(node.find("mass").attrib["value"])
+    def _from_xml(cls, node, root, path):
+        origin = parse_origin(node, default=False)
+        mass = float(n.attrib["value"]) if (n := node.find("mass")) is not None else None
         n = node.find("inertia")
         xx = float(n.attrib["ixx"])
         xy = float(n.attrib["ixy"])
@@ -1208,10 +1314,12 @@ class Inertial(URDFType):
 
     def _to_xml(self, parent, path):
         node = ET.Element("inertial")
-        node.append(unparse_origin(self.origin))
-        mass = ET.Element("mass")
-        mass.attrib["value"] = str(self.mass)
-        node.append(mass)
+        if self.origin is not None:
+            node.append(unparse_origin(self.origin))
+        if self.mass is not None:
+            mass = ET.Element("mass")
+            mass.attrib["value"] = str(self.mass)
+            node.append(mass)
         inertia = ET.Element("inertia")
         inertia.attrib["ixx"] = str(self.inertia[0, 0])
         inertia.attrib["ixy"] = str(self.inertia[0, 1])
@@ -1722,8 +1830,8 @@ class Actuator(URDFType):
         self._hardwareInterfaces = value
 
     @classmethod
-    def _from_xml(cls, node, path):
-        kwargs = cls._parse(node, path)
+    def _from_xml(cls, node, root, path):
+        kwargs = cls._parse(node, root, path)
         mr = node.find("mechanicalReduction")
         if mr is not None:
             mr = float(mr.text)
@@ -1812,8 +1920,8 @@ class TransmissionJoint(URDFType):
         self._hardwareInterfaces = value
 
     @classmethod
-    def _from_xml(cls, node, path):
-        kwargs = cls._parse(node, path)
+    def _from_xml(cls, node, root, path):
+        kwargs = cls._parse(node, root, path)
         hi = node.findall("hardwareInterface")
         if len(hi) > 0:
             hi = [h.text for h in hi]
@@ -1937,8 +2045,8 @@ class Transmission(URDFType):
         self._actuators = value
 
     @classmethod
-    def _from_xml(cls, node, path):
-        kwargs = cls._parse(node, path)
+    def _from_xml(cls, node, root, path):
+        kwargs = cls._parse(node, root, path)
         kwargs["trans_type"] = node.find("type").text
         return Transmission(**kwargs)
 
@@ -2120,7 +2228,7 @@ class Joint(URDFType):
 
     @origin.setter
     def origin(self, value):
-        self._origin = configure_origin(value)
+        self._origin = configure_origin(value, default=True)
 
     @property
     def limit(self):
@@ -2131,7 +2239,7 @@ class Joint(URDFType):
     def limit(self, value):
         if value is None:
             if self.joint_type in ["prismatic", "revolute"]:
-                raise ValueError("Require joint limit for prismatic and " "revolute joints")
+                raise ValueError("Require joint limit for prismatic and revolute joints")
         elif not isinstance(value, JointLimit):
             raise TypeError("Expected JointLimit type")
         self._limit = value
@@ -2202,8 +2310,8 @@ class Joint(URDFType):
         if self.joint_limit is None:
             return True
         cfg = float(cfg)
-        lower = -np.infty
-        upper = np.infty
+        lower = -np.inf
+        upper = np.inf
         if self.limit.lower is not None:
             lower = self.limit.lower
         if self.limit.upper is not None:
@@ -2321,8 +2429,8 @@ class Joint(URDFType):
             raise ValueError("Invalid configuration")
 
     @classmethod
-    def _from_xml(cls, node, path):
-        kwargs = cls._parse(node, path)
+    def _from_xml(cls, node, root, path):
+        kwargs = cls._parse(node, root, path)
         kwargs["joint_type"] = str(node.attrib["type"])
         kwargs["parent"] = node.find("parent").attrib["link"]
         kwargs["child"] = node.find("child").attrib["link"]
@@ -2330,7 +2438,7 @@ class Joint(URDFType):
         if axis is not None:
             axis = np.fromstring(axis.attrib["xyz"], sep=" ")
         kwargs["axis"] = axis
-        kwargs["origin"] = parse_origin(node)
+        kwargs["origin"] = parse_origin(node, default=True)
         return Joint(**kwargs)
 
     def _to_xml(self, parent, path):
@@ -2552,11 +2660,15 @@ class Link(URDFType):
                     scale = np.repeat(scale, 3)
                 sm[:3, :3] = np.diag(scale)
                 cm = self.collision_mesh.copy()
-                cm.density = self.inertial.mass / cm.volume
+                volume_orig = cm.volume
                 cm.apply_transform(sm)
+                volume_scaled = cm.volume
                 cmm = np.eye(4)
                 cmm[:3, 3] = cm.center_mass
-                inertial = Inertial(mass=cm.mass, inertia=cm.moment_inertia, origin=cmm)
+                mass = None
+                if self.inertial.mass is not None:
+                    mass = self.inertial.mass * (volume_scaled / volume_orig)
+                inertial = Inertial(mass=mass, inertia=cm.moment_inertia, origin=cmm)
 
         visuals = None
         if not collision_only:
@@ -2636,17 +2748,17 @@ class URDF(URDFType):
 
         for x in self._joints:
             if x.name in self._joint_map:
-                raise ValueError("Two joints with name {} " "found".format(x.name))
+                raise ValueError("Two joints with name {} found".format(x.name))
             self._joint_map[x.name] = x
 
         for x in self._transmissions:
             if x.name in self._transmission_map:
-                raise ValueError("Two transmissions with name {} " "found".format(x.name))
+                raise ValueError("Two transmissions with name {} found".format(x.name))
             self._transmission_map[x.name] = x
 
         for x in self._materials:
             if x.name in self._material_map:
-                raise ValueError("Two materials with name {} " "found".format(x.name))
+                raise ValueError("Two materials with name {} found".format(x.name))
             self._material_map[x.name] = x
 
         # Synchronize materials between links and top-level set
@@ -2870,7 +2982,7 @@ class URDF(URDFType):
         """(n,2) float : A lower and upper limit for each joint."""
         limits = []
         for joint in self.actuated_joints:
-            limit = [-np.infty, np.infty]
+            limit = [-np.inf, np.inf]
             if joint.limit is not None:
                 if joint.limit.lower is not None:
                     limit[0] = joint.limit.lower
@@ -2913,13 +3025,13 @@ class URDF(URDFType):
         # Process link set
         link_set = set()
         if link is not None:
-            if isinstance(link, six.string_types):
+            if isinstance(link, str):
                 link_set.add(self._link_map[link])
             elif isinstance(link, Link):
                 link_set.add(link)
         elif links is not None:
             for lnk in links:
-                if isinstance(lnk, six.string_types):
+                if isinstance(lnk, str):
                     link_set.add(self._link_map[lnk])
                 elif isinstance(lnk, Link):
                     link_set.add(lnk)
@@ -2957,7 +3069,7 @@ class URDF(URDFType):
             fk[lnk] = pose
 
         if link:
-            if isinstance(link, six.string_types):
+            if isinstance(link, str):
                 return fk[self._link_map[link]]
             else:
                 return fk[link]
@@ -2997,13 +3109,13 @@ class URDF(URDFType):
         # Process link set
         link_set = set()
         if link is not None:
-            if isinstance(link, six.string_types):
+            if isinstance(link, str):
                 link_set.add(self._link_map[link])
             elif isinstance(link, Link):
                 link_set.add(link)
         elif links is not None:
             for lnk in links:
-                if isinstance(lnk, six.string_types):
+                if isinstance(lnk, str):
                     link_set.add(self._link_map[lnk])
                 elif isinstance(lnk, Link):
                     link_set.add(lnk)
@@ -3040,7 +3152,7 @@ class URDF(URDFType):
             fk[lnk] = poses
 
         if link:
-            if isinstance(link, six.string_types):
+            if isinstance(link, str):
                 return fk[self._link_map[link]]
             else:
                 return fk[link]
@@ -3377,14 +3489,14 @@ class URDF(URDFType):
         elif isinstance(ct, dict):
             if len(ct) > 0:
                 for k in ct:
-                    val = np.asanyarray(ct[k]).astype(np.float64)
+                    val = np.asanyarray(ct[k], dtype=np.float64)
                     if traj_len is None:
                         traj_len = len(val)
                     elif traj_len != len(val):
                         raise ValueError("Trajectories must be same length")
                     ct_np[k] = val
         elif isinstance(ct, (list, tuple, np.ndarray)):
-            ct = np.asanyarray(ct).astype(np.float64)
+            ct = np.asanyarray(ct, dtype=np.float64)
             if ct.ndim == 1:
                 ct = ct.reshape(-1, 1)
             if ct.ndim != 2 or ct.shape[1] != len(self.actuated_joints):
@@ -3529,10 +3641,10 @@ class URDF(URDFType):
         urdf : :class:`.URDF`
             The parsed URDF.
         """
-        if isinstance(file_obj, six.string_types):
-            path, _ = os.path.split(file_obj)
+        if isinstance(file_obj, str):
+            path = os.path.dirname(file_obj)
         else:
-            path, _ = os.path.split(os.path.realpath(file_obj.name))
+            path = os.path.dirname(os.path.realpath(file_obj.name))
 
         node = self._to_xml(None, path)
         tree = ET.ElementTree(node)
@@ -3625,24 +3737,18 @@ class URDF(URDFType):
         urdf : :class:`.URDF`
             The parsed URDF.
         """
-        if isinstance(file_obj, six.string_types):
+        if isinstance(file_obj, str):
             if os.path.isfile(file_obj):
-                parser = ET.XMLParser(remove_comments=True, remove_blank_text=True)
-                with open(file_obj, "r") as f:
-                    file_str = f.read()
-                # version 0.0 cannot be parsed by lxml
-                file_str = file_str.replace('<?xml version="0.0" ?>', "").encode()
-                tree = ET.parse(io.BytesIO(file_str), parser=parser)
-                path, _ = os.path.split(file_obj)
+                tree = ET.parse(file_obj)
+                path = os.path.dirname(file_obj)
             else:
                 raise ValueError("{} is not a file".format(file_obj))
         else:
-            parser = ET.XMLParser(remove_comments=True, remove_blank_text=True)
-            tree = ET.parse(file_obj, parser=parser)
-            path, _ = os.path.split(file_obj.name)
+            tree = ET.parse(file_obj)
+            path = os.path.dirname(file_obj.name)
 
         node = tree.getroot()
-        return URDF._from_xml(node, path)
+        return URDF._from_xml(node, node, path)
 
     def _validate_joints(self):
         """Raise an exception of any joints are invalidly specified.
@@ -3709,7 +3815,7 @@ class URDF(URDFType):
         for t in self.transmissions:
             for joint in t.joints:
                 if joint.name not in self._joint_map:
-                    raise ValueError("Transmission {} has invalid joint name " "{}".format(t.name, joint.name))
+                    raise ValueError("Transmission {} has invalid joint name {}".format(t.name, joint.name))
 
     def _validate_graph(self):
         """Raise an exception if the link-joint structure is invalid.
@@ -3736,7 +3842,7 @@ class URDF(URDFType):
                 for n in cc:
                     cluster.append(n.name)
                 link_clusters.append(cluster)
-            message = "Links are not all connected. " "Connected components are:"
+            message = "Links are not all connected. Connected components are:"
             for lc in link_clusters:
                 message += "\n\t"
                 for n in lc:
@@ -3769,13 +3875,13 @@ class URDF(URDFType):
             return joint_cfg
         if isinstance(cfg, dict):
             for joint in cfg:
-                if isinstance(joint, six.string_types):
+                if isinstance(joint, str):
                     joint_cfg[self._joint_map[joint]] = cfg[joint]
                 elif isinstance(joint, Joint):
                     joint_cfg[joint] = cfg[joint]
         elif isinstance(cfg, (list, tuple, np.ndarray)):
             if len(cfg) != len(self.actuated_joints):
-                raise ValueError("Cfg must have same length as actuated joints " "if specified as a numerical array")
+                raise ValueError("Cfg must have same length as actuated joints if specified as a numerical array")
             for joint, value in zip(self.actuated_joints, cfg):
                 joint_cfg[joint] = value
         else:
@@ -3793,7 +3899,7 @@ class URDF(URDFType):
         n_cfgs = None
         if isinstance(cfgs, dict):
             for joint in cfgs:
-                if isinstance(joint, six.string_types):
+                if isinstance(joint, str):
                     joint_cfg[self._joint_map[joint]] = cfgs[joint]
                 else:
                     joint_cfg[joint] = cfgs[joint]
@@ -3804,7 +3910,7 @@ class URDF(URDFType):
             if isinstance(cfgs[0], dict):
                 for cfg in cfgs:
                     for joint in cfg:
-                        if isinstance(joint, six.string_types):
+                        if isinstance(joint, str):
                             joint_cfg[self._joint_map[joint]].append(cfg[joint])
                         else:
                             joint_cfg[joint].append(cfg[joint])
@@ -3826,9 +3932,9 @@ class URDF(URDFType):
         return joint_cfg, n_cfgs
 
     @classmethod
-    def _from_xml(cls, node, path):
+    def _from_xml(cls, node, root, path):
         valid_tags = set(["joint", "link", "transmission", "material"])
-        kwargs = cls._parse(node, path)
+        kwargs = cls._parse(node, root, path)
 
         extra_xml_node = ET.Element("extra")
         for child in node:
@@ -3918,12 +4024,8 @@ class URDF(URDFType):
                 for grandchild_node in G.successors(child_node):
                     joint_edge_vec1 = norm_vec(G_pos[parent_node] - G_pos[child_node])
                     joint_edge_vec2 = norm_vec(G_pos[grandchild_node] - G_pos[child_node])
-                    joint_rotmat = rotation_matrix_from_vectors(
-                        joint_edge_vec1, joint_edge_vec2
-                    )  # broken down into joint axis and initial pose
-                    joint_rotvec = Rotation.from_matrix(joint_rotmat).as_rotvec()
-                    joint_init_ang = np.linalg.norm(joint_rotvec)
-                    joint_axis = joint_rotvec / joint_init_ang  # the same as np.cross(joint_edge_vec2, joint_edge_vec1)
+                    joint_axis = np.cross(joint_edge_vec1, joint_edge_vec2)
+                    joint_axis /= np.linalg.norm(joint_axis)
                     joint_origin_rotmat = np.eye(3)
                     joint_origin = xyz_rotmat_to_matrix(joint_xyz, joint_origin_rotmat)
                     joint = Joint(

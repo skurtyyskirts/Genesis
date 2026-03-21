@@ -23,7 +23,10 @@ class Tensor(torch.Tensor):
         This overrides most of torch's operations. Here, we additionally let the returned tensor inherit parent tensors' scene, and check if the parent tensors being operated are derived from the same scene.
         """
 
-        # NOTE: This is a temporary hack. Due to some unknown reason, the unbind operation is super slow for gs.Tensor when requires_grad is True. This unbind operations seems to be the last internally called operation inside pytorch when we perform tensor operations. However, magically, disabling it (returning None) doesn't seem to affect anything, but helps bypass the time spent on it. Need to look into this further.
+        # FIXME: This is a temporary hack. Due to some unknown reason, the unbind operation is super slow for gs.Tensor
+        # when requires_grad is True. This unbind operations seems to be the last internally called operation inside
+        # pytorch when we perform tensor operations. However, magically, disabling it (returning None) doesn't seem to
+        # affect anything, but helps bypass the time spent on it. Need to look into this further.
         if func.__name__ == "unbind":
             return
 
@@ -51,7 +54,7 @@ class Tensor(torch.Tensor):
                     element.scene = scene
                     element.uid = gs.UID()
                     element.parents = parents
-        except:  # obj is a single tensor
+        except Exception:  # obj is a single tensor
             if isinstance(obj, cls):
                 obj.scene = scene
                 obj.uid = gs.UID()
@@ -93,15 +96,15 @@ class Tensor(torch.Tensor):
         obj.scene = None
         return obj
 
-    def _backward_from_ti(self, ti_kernel, *args):
+    def _backward_from_qd(self, qd_kernel, *args):
         temp_grad = gs.zeros_like(self, requires_grad=False)
         temp_grad.assert_contiguous()
-        ti_kernel(*args, temp_grad)
+        qd_kernel(*args, temp_grad)
         self.backward(gradient=temp_grad, retain_graph=True)
 
     def assert_contiguous(self):
         if not self.is_contiguous():
-            gs.raise_exception("Tensor not contiguogs.")
+            gs.raise_exception("Tensor not contiguous.")
 
     def assert_sceneless(self):
         if self.scene is not None:

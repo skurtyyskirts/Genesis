@@ -4,7 +4,6 @@ import genesis as gs
 
 
 def main():
-
     parser = argparse.ArgumentParser()
     parser.add_argument("-v", "--vis", action="store_true", default=False)
     parser.add_argument("-c", "--cpu", action="store_true", default=False)
@@ -21,7 +20,6 @@ def main():
             camera_fov=40,
         ),
         show_viewer=args.vis,
-        rigid_options=gs.options.RigidOptions(),
     )
 
     ########################## entities ##########################

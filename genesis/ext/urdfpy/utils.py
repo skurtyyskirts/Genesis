@@ -1,12 +1,12 @@
-"""Utilities for URDF parsing.
-"""
+"""Utilities for URDF parsing."""
 
 import os
-import genesis as gs
+import xml.etree.ElementTree as ET
 
-from lxml import etree as ET
+import trimesh
 import numpy as np
-from genesis.ext import trimesh
+
+import genesis as gs
 
 
 def rpy_to_matrix(coords):
@@ -132,7 +132,7 @@ def xyz_rpy_to_matrix(xyz_rpy):
     return matrix
 
 
-def parse_origin(node):
+def parse_origin(node, *, default):
     """Find the ``origin`` subelement of an XML node and convert it
     into a 4x4 homogenous transformation matrix.
 
@@ -149,8 +149,11 @@ def parse_origin(node):
         ``origin`` child. Defaults to the identity matrix if no ``origin``
         child was found.
     """
-    matrix = np.eye(4, dtype=np.float64)
     origin_node = node.find("origin")
+    if not default and origin_node is None:
+        return
+
+    matrix = np.eye(4, dtype=np.float64)
     if origin_node is not None:
         if "xyz" in origin_node.attrib:
             matrix[:3, 3] = np.fromstring(origin_node.attrib["xyz"], sep=" ")
@@ -171,7 +174,7 @@ def unparse_origin(matrix):
 
     Returns
     -------
-    node : :class`lxml.etree.Element`
+    node : :class:`xml.etree.ElementTree.Element`
         An XML node whose tag is ``origin``. The node has two attributes:
 
         - ``xyz`` - A string with three space-delimited floats representing
@@ -242,12 +245,21 @@ def load_meshes(filename):
     meshes : list of :class:`~trimesh.base.Trimesh`
         The meshes loaded from the file.
     """
-    meshes = trimesh.load(filename)
+    meshes = trimesh.load(filename, process=False)
 
-    # If we got a scene, dump the meshes
     if isinstance(meshes, trimesh.Scene):
-        meshes = list(meshes.dump())
-        meshes = [g for g in meshes if isinstance(g, trimesh.Trimesh)]
+        # FIXME: Scene.dump() has bug that uses copy without include_cache=True,
+        #  it will lose the vertex normals.
+        results = []
+        for node_name in meshes.graph.nodes_geometry:
+            transform, geometry_name = meshes.graph[node_name]
+            current = meshes.geometry[geometry_name].copy(include_cache=True)
+            if isinstance(current, trimesh.Trimesh):
+                current.apply_transform(transform)
+                current.metadata["name"] = geometry_name
+                current.metadata["node"] = node_name
+                results.append(current)
+        meshes = results
 
     if isinstance(meshes, (list, tuple, set)):
         meshes = list(meshes)
@@ -264,7 +276,7 @@ def load_meshes(filename):
     return meshes
 
 
-def configure_origin(value):
+def configure_origin(value, *, default):
     """Convert a value into a 4x4 transform matrix.
 
     Parameters
@@ -279,13 +291,13 @@ def configure_origin(value):
         The created matrix.
     """
     if value is None:
-        value = np.eye(4, dtype=np.float64)
-    elif isinstance(value, (list, tuple, np.ndarray)):
+        return np.eye(4, dtype=np.float64) if default else None
+    if isinstance(value, (list, tuple, np.ndarray)):
         value = np.asanyarray(value, dtype=np.float64)
         if value.shape == (6,):
             value = xyz_rpy_to_matrix(value)
         elif value.shape != (4, 4):
-            raise ValueError("Origin must be specified as a 4x4 " "homogenous transformation matrix")
+            raise ValueError("Origin must be specified as a 4x4 homogenous transformation matrix")
     else:
         raise TypeError("Invalid type for origin, expect 4x4 matrix")
     return value

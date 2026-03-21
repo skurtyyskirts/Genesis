@@ -12,7 +12,7 @@ class StateList(list):
     def __repr__(self):
         repr_str = "["
         for link_i in self:
-            repr_str += f"{link_i._repr_type()}\n"
+            repr_str += f"{link_i.__repr_name__()}\n"
         repr_str = repr_str[:-1] + "]"
         return repr_str
 
@@ -41,4 +41,4 @@ class QueriedStates:
         return self.states[key]
 
     def __repr__(self):
-        return f"{brief(self)}\n" f"states: {brief(self.states)}"
+        return f"{brief(self)}\nstates: {brief(self.states)}"

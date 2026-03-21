@@ -1,14 +1,16 @@
+import argparse
 import math
+import os
 from pathlib import Path
 
 import numpy as np
-import taichi as ti
+import quadrants as qd
 import cv2
 
 import genesis as gs
 
 
-@ti.data_oriented
+@qd.data_oriented
 class Jet(object):
     def __init__(
         self,
@@ -21,7 +23,7 @@ class Jet(object):
         sub_orbit_radius,
         sub_orbit_tau,
     ):
-        self.world_center = ti.Vector(world_center)
+        self.world_center = qd.Vector(world_center)
         self.orbit_radius = orbit_radius
         self.orbit_radius_vel = orbit_radius_vel
         self.orbit_init_radian = math.radians(orbit_init_degree)
@@ -34,22 +36,22 @@ class Jet(object):
         self.sub_orbit_radius = sub_orbit_radius
         self.sub_orbit_tau = sub_orbit_tau
 
-    @ti.func
+    @qd.func
     def get_pos(self, t: float):
-        rel_pos = ti.Vector([self.orbit_radius + t * self.orbit_radius_vel, 0.0, 0.0])
-        rot_mat = ti.math.rot_by_axis(ti.Vector([0.0, 1.0, 0.0]), self.orbit_init_radian + t * self.orbit_tau)[:3, :3]
+        rel_pos = qd.Vector([self.orbit_radius + t * self.orbit_radius_vel, 0.0, 0.0])
+        rot_mat = qd.math.rot_by_axis(qd.Vector([0.0, 1.0, 0.0]), self.orbit_init_radian + t * self.orbit_tau)[:3, :3]
         rel_pos = rot_mat @ rel_pos
         return rel_pos
 
-    @ti.func
+    @qd.func
     def get_factor(self, i: int, j: int, k: int, dx: float, t: float):
         rel_pos = self.get_pos(t)
         tan_dir = self.get_tan_dir(t)
-        ijk = ti.Vector([i, j, k], dt=gs.ti_float) * dx
+        ijk = qd.Vector([i, j, k], dt=gs.qd_float) * dx
         dist = 2 * self.jet_radius
-        for q in ti.static(range(self.num_sub_jets)):
-            jet_pos = ti.Vector([0.0, self.sub_orbit_radius, 0.0])
-            rot_mat = ti.math.rot_by_axis(tan_dir, self.sub_orbit_radian_delta * q + self.sub_orbit_tau * t)[:3, :3]
+        for q in qd.static(range(self.num_sub_jets)):
+            jet_pos = qd.Vector([0.0, self.sub_orbit_radius, 0.0])
+            rot_mat = qd.math.rot_by_axis(tan_dir, self.sub_orbit_radian_delta * q + self.sub_orbit_tau * t)[:3, :3]
             jet_pos = (rot_mat @ jet_pos) + self.world_center + rel_pos
             dist_q = (ijk - jet_pos).norm(gs.EPS)
             if dist_q < dist:
@@ -59,27 +61,35 @@ class Jet(object):
             factor = 1.0
         return factor
 
-    @ti.func
+    @qd.func
     def get_inward_dir(self, t: float):
         neg_pos = -self.get_pos(t)
         return neg_pos.normalized(gs.EPS)
 
-    @ti.func
+    @qd.func
     def get_tan_dir(self, t: float):
         inward_dir = self.get_inward_dir(t)
-        tan_rot_mat = ti.math.rot_by_axis(ti.Vector([0.0, 1.0, 0.0]), 0.0)[:3, :3]
+        tan_rot_mat = qd.math.rot_by_axis(qd.Vector([0.0, 1.0, 0.0]), 0.0)[:3, :3]
         return tan_rot_mat @ inward_dir
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-n", "--num_steps", type=int, default=200)
+    parser.add_argument("-c", "--cpu", action="store_true", default=False)
+    args = parser.parse_args()
+
+    args.num_steps = 1 if "PYTEST_VERSION" in os.environ else args.num_steps
+    substeps = 1 if "PYTEST_VERSION" in os.environ else 10
+    res = 32 if "PYTEST_VERSION" in os.environ else 384
+    args.cpu = True if "PYTEST_VERSION" in os.environ else args.cpu
 
     ########################## init ##########################
-    gs.init(seed=0, precision="32", logging_level="debug")
+    gs.init(backend=gs.cpu if args.cpu else gs.gpu, seed=0, precision="32", logging_level="info")
 
     video_path = Path(__file__).parent / "video"
     video_path.mkdir(exist_ok=True, parents=True)
 
-    res = 384
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(
             dt=1e-2,
@@ -120,11 +130,7 @@ def main():
 
     scene.build()
 
-    num_steps = 200
-    substeps = 10
-
-    for i in range(num_steps):
-
+    for i in range(args.num_steps):
         scalars = scene.sim.solvers[-1].grid.q.to_numpy().astype(np.float32)  # (res, res, res, 3)
         scalars[scalars < 1e-4] = 0
         layer = scalars[:, res // 2, :]

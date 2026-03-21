@@ -1,10 +1,13 @@
+import sys
+from functools import wraps
+
 import torch
 
 import genesis as gs
 
 from .tensor import Tensor
 
-_torch_creation_ops = [
+_torch_ops = (
     torch.tensor,
     torch.asarray,
     torch.as_tensor,
@@ -31,38 +34,30 @@ _torch_creation_ops = [
     torch.randint,
     torch.randint_like,
     torch.randperm,
-]
-
-_us_creation_op_template = """
-def {op.__name__}(*args, **kwargs):
-    return torch_op_wrapper(torch.{op.__name__}, *args, **kwargs)
-
-{op.__name__}.__doc__ = "This is the genesis wrapper of torch.{op.__name__}()."
-"""
+)
 
 
-def _is_float(torch_tensor):
-    return torch_tensor.dtype in [torch.float32, torch.float64]
+def torch_op_wrapper(torch_op):
+    @wraps(torch_op)
+    def _wrapper(*args, dtype=None, requires_grad=False, scene=None, **kwargs):
+        if "device" in kwargs:
+            gs.raise_exception("Device selection not supported. All genesis tensors are on GPU.")
 
+        if not gs._initialized:
+            gs.raise_exception("Genesis not initialized yet.")
 
-def _is_int(torch_tensor):
-    return torch_tensor.dtype in [torch.int32, torch.int64]
+        if torch_op is torch.from_numpy:
+            torch_tensor = torch_op(*args)
+        else:
+            torch_tensor = torch_op(*args, **kwargs)
 
+        return from_torch(torch_tensor, dtype, requires_grad, detach=True, scene=scene)
 
-def torch_op_wrapper(torch_op, *args, dtype=None, requires_grad=False, scene=None, **kwargs):
-    if "device" in kwargs:
-        gs.raise_exception("Device selection not supported. All genesis tensors are on GPU.")
+    _wrapper.__doc__ = (
+        f"This method is the genesis wrapper of `torch.{torch_op.__name__}`.\n\n------------------\n{_wrapper.__doc__}"
+    )
 
-    if not gs._initialized:
-        gs.raise_exception("Genesis not initialized yet.")
-
-    if torch_op is torch.from_numpy:
-        torch_tensor = torch_op(*args)
-    else:
-        torch_tensor = torch_op(*args, **kwargs)
-
-    gs_tensor = from_torch(torch_tensor, dtype, requires_grad, detach=True, scene=scene)
-    return gs_tensor
+    return _wrapper
 
 
 def from_torch(torch_tensor, dtype=None, requires_grad=False, detach=True, scene=None):
@@ -70,18 +65,15 @@ def from_torch(torch_tensor, dtype=None, requires_grad=False, detach=True, scene
     By default, detach is True, meaning that this function returns a new leaf tensor which is not connected to torch_tensor's computation gragh.
     """
     if dtype is None:
-        if _is_float(torch_tensor):
-            dtype = gs.tc_float
-        elif _is_int(torch_tensor):
-            dtype = gs.tc_int
-        else:
-            dtype = torch_tensor.dtype
-    elif dtype is float:
+        dtype = torch_tensor.dtype
+    if dtype in (float, torch.float32, torch.float64):
         dtype = gs.tc_float
-    elif dtype is int:
+    elif dtype in (int, torch.int32, torch.int64):
         dtype = gs.tc_int
+    elif dtype in (bool, torch.bool):
+        dtype = torch.bool
     else:
-        gs.raise_exception("Supported dtype: [None, int, float]")
+        gs.raise_exception(f"Unsupported dtype: {dtype}")
 
     if torch_tensor.requires_grad and (not detach) and (not requires_grad):
         gs.logger.warning(
@@ -100,12 +92,5 @@ def from_torch(torch_tensor, dtype=None, requires_grad=False, detach=True, scene
     return gs_tensor
 
 
-_raw_map = {8: r"\b", 7: r"\a", 12: r"\f", 10: r"\n", 13: r"\r", 9: r"\t", 11: r"\v"}
-
-
-def _convert_to_raw_str(s):
-    return r"".join([_raw_map.get(ord(c), c) for c in s])
-
-
-for op in _torch_creation_ops:
-    exec(eval(_convert_to_raw_str(f"f'{_us_creation_op_template}'")))
+for _torch_op in _torch_ops:
+    setattr(sys.modules[__name__], _torch_op.__name__, torch_op_wrapper(_torch_op))

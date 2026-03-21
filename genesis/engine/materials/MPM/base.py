@@ -1,12 +1,43 @@
-import taichi as ti
+import platform
+import sys
+from typing import TYPE_CHECKING
+
+import quadrants as qd
 
 import genesis as gs
 
 from ..base import Material
 
+if TYPE_CHECKING:
+    from genesis.engine.entities.mpm_entity import MPMEntity
 
-@ti.data_oriented
-class Base(Material):
+
+@qd.data_oriented
+class Base(Material["MPMEntity"]):
+    """
+    The base class of MPM materials.
+
+    Note
+    ----
+    This class should *not* be instantiated directly.
+
+    Parameters
+    ----------
+    E: float, optional
+        Young's modulus. Default is 1e6.
+    nu: float, optional
+        Poisson ratio. Default is 0.2.
+    rho: float, optional
+        Density (kg/m^3). Default is 1000.
+    lam: float, optional
+        The first Lame's parameter. Default is None, computed by E and nu.
+    mu: float, optional
+        The second Lame's parameter. Default is None, computed by E and nu.
+    sampler: str, optional
+        Particle sampler ('pbs', 'regular', 'random'). Note that 'pbs' is only supported on Linux x86 for now. Defaults
+        to 'pbs' on supported platforms, 'random' otherwise.
+    """
+
     def __init__(
         self,
         E=1e6,  # Young's modulus
@@ -14,12 +45,19 @@ class Base(Material):
         rho=1000.0,  # density (kg/m^3)
         lam=None,  # Lame's first parameter
         mu=None,  # Lame's second parameter
-        sampler="pbs",  # particle sampler
+        sampler=None,  # particle sampler
     ):
         """
         lam and mu will be computed based on E and nu if not provided.
         """
         super().__init__()
+
+        if sampler is None:
+            sampler = "pbs" if (sys.platform == "linux" and platform.machine() == "x86_64") else "random"
+        if not (sampler in ("pbs", "random", "regular") or sampler.startswith("pbs-")):
+            gs.raise_exception(
+                f"Particle sampler must be either 'pbs(-[0-9]+)', 'random' or 'regular. Got '{sampler}'."
+            )
 
         self._E = E
         self._nu = nu
@@ -41,19 +79,15 @@ class Base(Material):
         # will be set when added to solver
         self._idx = None
 
-    @classmethod
-    def _repr_type(cls):
-        return f"<gs.materials.MPM.{cls.__name__}>"
-
-    @ti.func
+    @qd.func
     def update_F_S_Jp(self, J, F_tmp, U, S, V, Jp):
         raise NotImplementedError
 
-    @ti.func
+    @qd.func
     def update_stress(self, U, S, V, F_tmp, F_new, J, Jp, actu, m_dir):
-        # NOTE: class member function inheritance will still introduce redundant computation graph in taichi
-        stress = 2 * self._mu * (F_new - U @ V.transpose()) @ F_new.transpose() + ti.Matrix.identity(
-            gs.ti_float, 3
+        # NOTE: class member function inheritance will still introduce redundant computation graph in quadrants
+        stress = 2 * self._mu * (F_new - U @ V.transpose()) @ F_new.transpose() + qd.Matrix.identity(
+            gs.qd_float, 3
         ) * self._lam * J * (J - 1)
 
         return stress
@@ -70,33 +104,35 @@ class Base(Material):
         return False
 
     @property
-    def uid(self):
-        return self._uid
-
-    @property
     def idx(self):
         return self._idx
 
     @property
     def E(self):
+        """Young's modulus."""
         return self._E
 
     @property
     def nu(self):
+        """Poisson ratio."""
         return self._nu
 
     @property
     def mu(self):
+        """The first Lame parameter."""
         return self._mu
 
     @property
     def lam(self):
+        """The second Lame parameter."""
         return self._lam
 
     @property
     def rho(self):
+        """The rest density."""
         return self._rho
 
     @property
     def sampler(self):
+        """Particle sampler ('pbs', 'regular', 'random')"""
         return self._sampler

@@ -1,18 +1,9 @@
 import enum
 
-import taichi as ti
 
 # dynamic loading
 ACTIVE = 1
 INACTIVE = 0
-
-# misc
-EPS = None
-SEED = None
-
-# logging
-logger = None
-error_msg = None
 
 
 class IntEnum(enum.IntEnum):
@@ -25,13 +16,15 @@ class IntEnum(enum.IntEnum):
 
 # geom type in rigid solver
 class GEOM_TYPE(IntEnum):
+    # Beware PLANE must be the first geometry type as this is assumed by MPR collision detection.
     PLANE = 0
     SPHERE = 1
-    CYLINDER = 2
-    CAPSULE = 3
-    BOX = 4
-    MESH = 5
-    TERRAIN = 6
+    ELLIPSOID = 2
+    CYLINDER = 3
+    CAPSULE = 4
+    BOX = 5
+    MESH = 6
+    TERRAIN = 7
 
 
 # joint type in rigid solver, ranked by number of dofs
@@ -41,10 +34,14 @@ class JOINT_TYPE(IntEnum):
     PRISMATIC = 2
     SPHERICAL = 3
     FREE = 4
-    PLANAR = 5
 
 
-# joint type in rigid solver, ranked by number of dofs
+class EQUALITY_TYPE(IntEnum):
+    CONNECT = 0
+    WELD = 1
+    JOINT = 2
+
+
 class CTRL_MODE(IntEnum):
     FORCE = 0
     VELOCITY = 1
@@ -70,52 +67,22 @@ class backend(IntEnum):
     cpu = 0
     gpu = 1
     cuda = 2
-    vulkan = 3
+    amdgpu = 3
     metal = 4
-    opengl = 5
 
     def __format__(self, format_spec):
         return f"gs.{self.name}"
 
 
-GS_ARCH = {
-    "macOS": {
-        backend.cpu: backend.cpu,
-        backend.gpu: backend.metal,
-        backend.metal: backend.metal,
-        backend.vulkan: backend.vulkan,
-    },
-    "Linux": {
-        backend.cpu: backend.cpu,
-        backend.gpu: backend.cuda,
-        backend.cuda: backend.cuda,
-        backend.vulkan: backend.vulkan,
-    },
-    "Windows": {
-        backend.cpu: backend.cpu,
-        backend.gpu: backend.cuda,
-        backend.cuda: backend.cuda,
-        backend.vulkan: backend.vulkan,
-    },
-}
+# image types for visualization
+class IMAGE_TYPE(IntEnum):
+    RGB = 0
+    DEPTH = 1
+    SEGMENTATION = 2
+    NORMAL = 3
 
-TI_ARCH = {
-    "macOS": {
-        backend.cpu: ti.cpu,
-        backend.metal: ti.metal,
-        backend.vulkan: ti.vulkan,
-    },
-    "Linux": {
-        backend.cpu: ti.cpu,
-        backend.cuda: ti.cuda,
-        backend.vulkan: ti.vulkan,
-    },
-    "Windows": {
-        backend.cpu: ti.cpu,
-        backend.cuda: ti.cuda,
-        backend.vulkan: ti.vulkan,
-    },
-}
+    def __format__(self, format_spec):
+        return self.name
 
 
 # parallelize

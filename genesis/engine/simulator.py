@@ -1,13 +1,29 @@
+from typing import TYPE_CHECKING
+
 import numpy as np
-import taichi as ti
 
 import genesis as gs
+from genesis.options.morphs import Morph
+from genesis.options.solvers import (
+    KinematicOptions,
+    BaseCouplerOptions,
+    IPCCouplerOptions,
+    LegacyCouplerOptions,
+    SAPCouplerOptions,
+    FEMOptions,
+    MPMOptions,
+    PBDOptions,
+    RigidOptions,
+    SFOptions,
+    SPHOptions,
+    SimOptions,
+    ToolOptions,
+)
 from genesis.repr_base import RBC
 
-from .coupler import Coupler
 from .entities import HybridEntity
 from .solvers import (
-    AvatarSolver,
+    KinematicSolver,
     FEMSolver,
     MPMSolver,
     PBDSolver,
@@ -16,11 +32,21 @@ from .solvers import (
     SPHSolver,
     ToolSolver,
 )
+from .couplers import IPCCoupler, LegacyCoupler, SAPCoupler
 from .states.cache import QueriedStates
 from .states.solvers import SimState
+from .sensors import SensorManager
+
+if TYPE_CHECKING:
+    from genesis.engine.scene import Scene
+    from genesis.engine.entities.base_entity import Entity
+
+    from .solvers.base_solver import Solver
 
 
-@ti.data_oriented
+RATE_CHECK_ERRNO = 10
+
+
 class Simulator(RBC):
     """
     A simulator is a scene-level simulation manager, which manages all simulation-related operations in the scene, including multiple solvers and the inter-solver coupler.
@@ -37,8 +63,6 @@ class Simulator(RBC):
         A ToolOptions object that contains all the options for the ToolSolver.
     rigid_options : gs.RigidOptions
         A RigidOptions object that contains all the options for the RigidSolver.
-    avatar_options : gs.AvatarOptions
-        An AvatarOptions object that contains all the options for the AvatarSolver.
     mpm_options : gs.MPMOptions
         An MPMOptions object that contains all the options for the MPMSolver.
     sph_options : gs.SPHOptions
@@ -53,17 +77,17 @@ class Simulator(RBC):
 
     def __init__(
         self,
-        scene,
-        options,
-        coupler_options,
-        tool_options,
-        rigid_options,
-        avatar_options,
-        mpm_options,
-        sph_options,
-        fem_options,
-        sf_options,
-        pbd_options,
+        scene: "Scene",
+        options: SimOptions,
+        coupler_options: BaseCouplerOptions,
+        tool_options: ToolOptions,
+        rigid_options: RigidOptions,
+        kinematic_options: KinematicOptions,
+        mpm_options: MPMOptions,
+        sph_options: SPHOptions,
+        fem_options: FEMOptions,
+        sf_options: SFOptions,
+        pbd_options: PBDOptions,
     ):
         self._scene = scene
 
@@ -72,38 +96,38 @@ class Simulator(RBC):
         self.coupler_options = coupler_options
         self.tool_options = tool_options
         self.rigid_options = rigid_options
-        self.avatar_options = avatar_options
+        self.kinematic_options = kinematic_options
         self.mpm_options = mpm_options
         self.sph_options = sph_options
         self.fem_options = fem_options
         self.sf_options = sf_options
         self.pbd_options = pbd_options
 
-        self._dt = options.dt
-        self._substep_dt = options.dt / options.substeps
-        self._substeps = options.substeps
-        self._substeps_local = options.substeps_local
-        self._requires_grad = options.requires_grad
-        self._steps_local = options._steps_local
+        self._dt: float = options.dt
+        self._substep_dt: float = options.dt / options.substeps
+        self._substeps: int = options.substeps
+        self._substeps_local: int | None = options.substeps_local
+        self._requires_grad: bool = options.requires_grad
+        self._steps_local: int | None = options._steps_local
 
         self._cur_substep_global = 0
-        self._gravity = np.array(options.gravity)
+        self._gravity = np.array(options.gravity, dtype=gs.np_float)
 
         # solvers
         self.tool_solver = ToolSolver(self.scene, self, self.tool_options)
         self.rigid_solver = RigidSolver(self.scene, self, self.rigid_options)
-        self.avatar_solver = AvatarSolver(self.scene, self, self.avatar_options)
+        self.kinematic_solver = KinematicSolver(self.scene, self, self.kinematic_options)
         self.mpm_solver = MPMSolver(self.scene, self, self.mpm_options)
         self.sph_solver = SPHSolver(self.scene, self, self.sph_options)
         self.pbd_solver = PBDSolver(self.scene, self, self.pbd_options)
         self.fem_solver = FEMSolver(self.scene, self, self.fem_options)
         self.sf_solver = SFSolver(self.scene, self, self.sf_options)
 
-        self._solvers = gs.List(
+        self._solvers: list["Solver"] = gs.List(
             [
                 self.tool_solver,
                 self.rigid_solver,
-                self.avatar_solver,
+                self.kinematic_solver,
                 self.mpm_solver,
                 self.sph_solver,
                 self.pbd_solver,
@@ -112,44 +136,51 @@ class Simulator(RBC):
             ]
         )
 
-        self._active_solvers = gs.List()
+        self._active_solvers: list["Solver"] = gs.List()
 
         # coupler
-        self._coupler = Coupler(self, self.coupler_options)
+        if isinstance(self.coupler_options, SAPCouplerOptions):
+            self._coupler = SAPCoupler(self, self.coupler_options)
+        elif isinstance(self.coupler_options, LegacyCouplerOptions):
+            self._coupler = LegacyCoupler(self, self.coupler_options)
+        elif isinstance(self.coupler_options, IPCCouplerOptions):
+            self._coupler = IPCCoupler(self, self.coupler_options)
+        else:
+            gs.raise_exception(
+                f"Coupler options {self.coupler_options} not supported. Please use SAPCouplerOptions, LegacyCouplerOptions, or IPCCouplerOptions."
+            )
 
         # states
         self._queried_states = QueriedStates()
 
         # entities
-        self._entities = gs.List()
+        self._entities: list["Entity"] = gs.List()
 
-    def _add_entity(self, morph, material, surface, visualize_contact=False):
+        # sensors
+        self._sensor_manager = SensorManager(self)
+
+    def _add_entity(self, morph: Morph, material, surface, visualize_contact=False, name: str | None = None):
         if isinstance(material, gs.materials.Tool):
-            entity = self.tool_solver.add_entity(self.n_entities, material, morph, surface)
-
-        elif isinstance(material, gs.materials.Avatar):
-            entity = self.avatar_solver.add_entity(self.n_entities, material, morph, surface, visualize_contact)
-
+            entity = self.tool_solver.add_entity(self.n_entities, material, morph, surface, name=name)
         elif isinstance(material, gs.materials.Rigid):
-            entity = self.rigid_solver.add_entity(self.n_entities, material, morph, surface, visualize_contact)
-
+            entity = self.rigid_solver.add_entity(
+                self.n_entities, material, morph, surface, visualize_contact, name=name
+            )
+        elif isinstance(material, gs.materials.Kinematic):
+            entity = self.kinematic_solver.add_entity(
+                self.n_entities, material, morph, surface, visualize_contact=False, name=name
+            )
         elif isinstance(material, gs.materials.MPM.Base):
-            entity = self.mpm_solver.add_entity(self.n_entities, material, morph, surface)
-
+            entity = self.mpm_solver.add_entity(self.n_entities, material, morph, surface, name=name)
         elif isinstance(material, gs.materials.SPH.Base):
-            entity = self.sph_solver.add_entity(self.n_entities, material, morph, surface)
-
+            entity = self.sph_solver.add_entity(self.n_entities, material, morph, surface, name=name)
         elif isinstance(material, gs.materials.PBD.Base):
-            entity = self.pbd_solver.add_entity(self.n_entities, material, morph, surface)
-
+            entity = self.pbd_solver.add_entity(self.n_entities, material, morph, surface, name=name)
         elif isinstance(material, gs.materials.FEM.Base):
-            entity = self.fem_solver.add_entity(self.n_entities, material, morph, surface)
-
+            entity = self.fem_solver.add_entity(self.n_entities, material, morph, surface, name=name)
         elif isinstance(material, gs.materials.Hybrid):
-            entity = HybridEntity(
-                self.n_entities, self.scene, material, morph, surface
-            )  # adding to solver is handled in the hybrid entity
-
+            # Note that adding to solver is handled in the hybrid entity
+            entity = HybridEntity(self.n_entities, self.scene, material, morph, surface, name=name)
         else:
             gs.raise_exception(f"Material not supported.: {material}")
 
@@ -161,37 +192,47 @@ class Simulator(RBC):
             solver._add_force_field(force_field)
 
     def build(self):
-
         self.n_envs = self.scene.n_envs
         self._B = self.scene._B
         self._para_level = self.scene._para_level
 
         # solvers
-        self._rigid_only = self.rigid_solver.is_active()
+        # IPCCoupler needs full substep flow for pre/post coupling phases
+        self._rigid_only = self.rigid_solver.is_active and not isinstance(self._coupler, (SAPCoupler, IPCCoupler))
         for solver in self._solvers:
             solver.build()
-            if solver.is_active():
+            if solver.is_active:
                 self._active_solvers.append(solver)
                 if not isinstance(solver, RigidSolver):
                     self._rigid_only = False
         self._coupler.build()
 
-        if self.n_envs > 0 and not self._rigid_only:
-            gs.raise_exception("Batching is only supported for rigid-only scenes as of now.")
+        if self.n_envs > 0 and self.sf_solver.is_active:
+            gs.raise_exception("Batching is not supported for SF solver as of now.")
 
         # hybrid
         for entity in self._entities:
             if isinstance(entity, HybridEntity):
                 entity.build()
 
-    def reset(self, state):
+        self._sensor_manager.build()
+
+    def destroy(self):
+        self._sensor_manager.destroy()
+
+    def reset(self, state: SimState, envs_idx=None):
         for solver, solver_state in zip(self._solvers, state):
-            solver.set_state(0, solver_state)
+            if solver.n_entities > 0:
+                solver.set_state(0, solver_state, envs_idx)
 
-        self.coupler.reset()
+        self._coupler.reset(envs_idx=envs_idx)
 
+        # TODO: keeping as is for now
         self.reset_grad()
         self._cur_substep_global = 0
+
+        # reset sensors state
+        self._sensor_manager.reset(envs_idx=envs_idx)
 
     def reset_grad(self):
         for solver in self._active_solvers:
@@ -229,11 +270,17 @@ class Simulator(RBC):
     # ------------------------------------------------------------------------------------
 
     def step(self, in_backward=False):
-        if self._rigid_only:  # "Only Advance!" --Thomas Wade :P
-            for _ in range(self._substeps):
-                self.rigid_solver.substep()
-                self._cur_substep_global += 1
+        # Check errno at the very beginning of the step.
+        # This will trigger GPU sync, but it is not a big deal at the point, since we are going to enqueue very large
+        # kernel right away. Moreover, if computations are still not done at this point, then the queue will just
+        # continue growing endlessly, which will not make the simulation faster either.
+        if self.rigid_solver.is_active and self._cur_substep_global % RATE_CHECK_ERRNO == 0:
+            self.rigid_solver.check_errno()
 
+        if self._rigid_only and not self._requires_grad:  # "Only Advance!" --Thomas Wade :P
+            for _ in range(self._substeps):
+                self.rigid_solver.substep(self.cur_substep_local)
+                self._cur_substep_global += 1
         else:
             self.process_input(in_backward=in_backward)
             for _ in range(self._substeps):
@@ -243,9 +290,13 @@ class Simulator(RBC):
                 if self.cur_substep_local == 0 and not in_backward:
                     self.save_ckpt()
 
+        if self.rigid_solver.is_active:
+            self.rigid_solver.clear_external_force()
+
+        self._sensor_manager.step()
+
     def _step_grad(self):
         for _ in range(self._substeps - 1, -1, -1):
-
             if self.cur_substep_local == 0:
                 self.load_ckpt()
             self._cur_substep_global -= 1
@@ -369,12 +420,17 @@ class Simulator(RBC):
 
         return state
 
+    def set_gravity(self, gravity, envs_idx=None):
+        for solver in self._solvers:
+            if solver.is_active:
+                solver.set_gravity(gravity, envs_idx)
+
     # ------------------------------------------------------------------------------------
     # ----------------------------------- properties -------------------------------------
     # ------------------------------------------------------------------------------------
 
     @property
-    def dt(self):
+    def dt(self) -> float:
         """The time duration for each simulation step."""
         return self._dt
 
@@ -399,7 +455,7 @@ class Simulator(RBC):
         return self._requires_grad
 
     @property
-    def n_entities(self):
+    def n_entities(self) -> int:
         """The number of entities in the simulator."""
         return len(self._entities)
 

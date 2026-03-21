@@ -1,163 +1,62 @@
-import argparse
+import os
+
 import numpy as np
+
 import genesis as gs
-import time
-import threading
-from pynput import keyboard
+from genesis.vis.keybindings import Key, KeyAction, Keybind
 
 
 class DroneController:
     def __init__(self):
-        self.thrust = 14468.429183500699  # Base hover RPM - constant hover
-        self.rotation_delta = 200  # Differential RPM for rotation
-        self.thrust_delta = 10  # Amount to change thrust by when accelerating/decelerating
-        self.running = True
-        self.rpms = [self.thrust] * 4
-        self.pressed_keys = set()
+        self.thrust = 14475.8  # Base RPM for constant hover
+        self.rotation_delta = 100.0  # Differential RPM for rotation
+        self.thrust_delta = 10.0  # Amount to change thrust by when accelerating/decelerating
+        self.cur_dir = np.array([0.0, 0.0, 0.0, 0.0])  # rotor directions
 
-    def on_press(self, key):
-        try:
-            if key == keyboard.Key.esc:
-                self.running = False
-                return False
-            self.pressed_keys.add(key)
-            print(f"Key pressed: {key}")
-        except AttributeError:
-            pass
+    def update_rpms(self):
+        """Compute RPMs based on current direction and thrust"""
+        clipped_dir = np.clip(self.cur_dir, -1.0, 1.0)
+        rpms = self.thrust + clipped_dir * self.rotation_delta
+        return np.clip(rpms, 0, 25000)
 
-    def on_release(self, key):
-        try:
-            self.pressed_keys.discard(key)
-        except KeyError:
-            pass
+    def add_direction(self, direction: np.ndarray):
+        """Add direction vector (on key press)"""
+        self.cur_dir += direction
 
-    def update_thrust(self):
-        # Store previous RPMs for debugging
-        prev_rpms = self.rpms.copy()
+    def accelerate(self):
+        """Increase base thrust"""
+        self.thrust = min(self.thrust + self.thrust_delta, 25000)
 
-        # Reset RPMs to hover thrust
-        self.rpms = [self.thrust] * 4
-
-        # Acceleration (Spacebar) - All rotors spin faster
-        if keyboard.Key.space in self.pressed_keys:
-            self.thrust += self.thrust_delta
-            self.rpms = [self.thrust] * 4
-            print("Accelerating")
-
-        # Deceleration (Left Shift) - All rotors spin slower
-        if keyboard.Key.shift in self.pressed_keys:
-            self.thrust -= self.thrust_delta
-            self.rpms = [self.thrust] * 4
-            print("Decelerating")
-
-        # Forward (North) - Front rotors spin faster
-        if keyboard.Key.up in self.pressed_keys:
-            self.rpms[0] += self.rotation_delta  # Front left
-            self.rpms[1] += self.rotation_delta  # Front right
-            self.rpms[2] -= self.rotation_delta  # Back left
-            self.rpms[3] -= self.rotation_delta  # Back right
-            print("Moving Forward")
-
-        # Backward (South) - Back rotors spin faster
-        if keyboard.Key.down in self.pressed_keys:
-            self.rpms[0] -= self.rotation_delta  # Front left
-            self.rpms[1] -= self.rotation_delta  # Front right
-            self.rpms[2] += self.rotation_delta  # Back left
-            self.rpms[3] += self.rotation_delta  # Back right
-            print("Moving Backward")
-
-        # Left (West) - Left rotors spin faster
-        if keyboard.Key.left in self.pressed_keys:
-            self.rpms[0] -= self.rotation_delta  # Front left
-            self.rpms[2] -= self.rotation_delta  # Back left
-            self.rpms[1] += self.rotation_delta  # Front right
-            self.rpms[3] += self.rotation_delta  # Back right
-            print("Moving Left")
-
-        # Right (East) - Right rotors spin faster
-        if keyboard.Key.right in self.pressed_keys:
-            self.rpms[0] += self.rotation_delta  # Front left
-            self.rpms[2] += self.rotation_delta  # Back left
-            self.rpms[1] -= self.rotation_delta  # Front right
-            self.rpms[3] -= self.rotation_delta  # Back right
-            print("Moving Right")
-
-        self.rpms = np.clip(self.rpms, 0, 25000)
-
-        # Debug print if any RPMs changed
-        if not np.array_equal(prev_rpms, self.rpms):
-            print(f"RPMs changed from {prev_rpms} to {self.rpms}")
-
-        return self.rpms
-
-
-def update_camera(scene, drone):
-    """Updates the camera position to follow the drone"""
-    if not scene.viewer:
-        return
-
-    drone_pos = drone.get_pos()
-
-    # Camera position relative to drone
-    offset_x = 0.0  # centered horizontally
-    offset_y = -4.0  # 4 units behind (in Y axis)
-    offset_z = 2.0  # 2 units above
-
-    camera_pos = (float(drone_pos[0] + offset_x), float(drone_pos[1] + offset_y), float(drone_pos[2] + offset_z))
-
-    # Update camera position and look target
-    scene.viewer.set_camera_pose(pos=camera_pos, lookat=tuple(float(x) for x in drone_pos))
-
-
-def run_sim(scene, drone, controller):
-    while controller.running:
-        try:
-            # Update drone with current RPMs
-            rpms = controller.update_thrust()
-            drone.set_propellels_rpm(rpms)
-
-            # Update physics
-            scene.step()
-
-            # Update camera position to follow drone
-            update_camera(scene, drone)
-
-            time.sleep(1 / 60)  # Limit simulation rate
-        except Exception as e:
-            print(f"Error in simulation loop: {e}")
-
-    if scene.viewer:
-        scene.viewer.stop()
+    def decelerate(self):
+        """Decrease base thrust"""
+        self.thrust = max(self.thrust - self.thrust_delta, 0)
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-v", "--vis", action="store_true", default=True, help="Enable visualization (default: True)")
-    parser.add_argument("-m", "--mac", action="store_true", default=False, help="Running on MacOS (default: False)")
-    args = parser.parse_args()
-
     # Initialize Genesis
     gs.init(backend=gs.cpu)
 
-    # Create scene with initial camera view
-    viewer_options = gs.options.ViewerOptions(
-        camera_pos=(0.0, -4.0, 2.0),  # Now behind the drone (negative Y)
-        camera_lookat=(0.0, 0.0, 0.5),
-        camera_fov=45,
-        max_FPS=60,
-    )
-
+    # Create scene
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(
             dt=0.01,
             gravity=(0, 0, -9.81),
         ),
-        viewer_options=viewer_options,
-        show_viewer=args.vis,
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.0, -2.0, 1.0),
+            camera_lookat=(0.0, 0.0, 0.3),
+            camera_fov=45,
+            max_FPS=60,
+        ),
+        vis_options=gs.options.VisOptions(
+            show_world_frame=False,
+        ),
+        show_viewer=True,
+        show_FPS=False,
     )
 
     # Add entities
-    plane = scene.add_entity(gs.morphs.Plane())
+    scene.add_entity(gs.morphs.Plane())
     drone = scene.add_entity(
         morph=gs.morphs.Drone(
             file="urdf/drones/cf2x.urdf",
@@ -165,11 +64,50 @@ def main():
         ),
     )
 
-    # Build scene
-    scene.build()
+    scene.viewer.follow_entity(drone)
 
     # Initialize controller
     controller = DroneController()
+
+    # Build scene
+    scene.build()
+
+    # Register keybindings
+    def direction_keybinds(name: str, key: Key, direction: tuple[float, float, float, float]):
+        """Helper to create press/release keybinds for a direction"""
+        dir_arr = np.array(direction)
+        return [
+            Keybind(
+                name=f"{name}_hold",
+                key=key,
+                key_action=KeyAction.HOLD,
+                callback=controller.add_direction,
+                args=(dir_arr,),
+            ),
+            Keybind(
+                name=f"{name}_release",
+                key=key,
+                key_action=KeyAction.RELEASE,
+                callback=controller.add_direction,
+                args=(-dir_arr,),
+            ),
+        ]
+
+    is_running = True
+
+    def stop():
+        nonlocal is_running
+        is_running = False
+
+    scene.viewer.register_keybinds(
+        *direction_keybinds("move_forward", Key.UP, (1.0, 1.0, -1.0, -1.0)),
+        *direction_keybinds("move_backward", Key.DOWN, (-1.0, -1.0, 1.0, 1.0)),
+        *direction_keybinds("move_left", Key.LEFT, (-1.0, 1.0, -1.0, 1.0)),
+        *direction_keybinds("move_right", Key.RIGHT, (1.0, -1.0, 1.0, -1.0)),
+        Keybind("accelerate", Key.SPACE, KeyAction.HOLD, callback=controller.accelerate),
+        Keybind("decelerate", Key.LSHIFT, KeyAction.HOLD, callback=controller.decelerate),
+        Keybind("quit", Key.ESCAPE, KeyAction.RELEASE, callback=stop),
+    )
 
     # Print control instructions
     print("\nDrone Controls:")
@@ -177,27 +115,25 @@ def main():
     print("↓ - Move Backward (South)")
     print("← - Move Left (West)")
     print("→ - Move Right (East)")
-    print("ESC - Quit\n")
-    print("Initial hover RPM:", controller.thrust)
+    print("space - Increase RPM")
+    print("shift - Decrease RPM")
 
-    # Start keyboard listener
-    listener = keyboard.Listener(on_press=controller.on_press, on_release=controller.on_release)
-    listener.start()
+    # Run simulation
+    try:
+        while is_running:
+            # Update and apply RPMs based on current direction
+            rpms = controller.update_rpms()
+            drone.set_propellels_rpm(rpms)
 
-    if args.mac:
-        # Run simulation in another thread
-        sim_thread = threading.Thread(target=run_sim, args=(scene, drone, controller))
-        sim_thread.start()
+            # Step simulation
+            scene.step()
 
-        if args.vis:
-            scene.viewer.start()
-
-        # Wait for threads to finish
-        sim_thread.join()
-    else:
-        # Run simulation in main thread
-        run_sim(scene, drone, controller)
-    listener.stop()
+            if "PYTEST_VERSION" in os.environ:
+                break
+    except KeyboardInterrupt:
+        gs.logger.info("Simulation interrupted, exiting.")
+    finally:
+        gs.logger.info("Simulation finished.")
 
 
 if __name__ == "__main__":

@@ -6,13 +6,12 @@ import genesis as gs
 
 
 def main():
-
     parser = argparse.ArgumentParser()
     parser.add_argument("-v", "--vis", action="store_true", default=False)
     args = parser.parse_args()
 
     ########################## init ##########################
-    gs.init(seed=0, precision="32", logging_level="debug")
+    gs.init(precision="32", logging_level="info")
     np.set_printoptions(precision=7, suppress=True)
 
     ########################## create a scene ##########################
@@ -23,12 +22,12 @@ def main():
             camera_fov=40,
             max_FPS=200,
         ),
-        show_viewer=args.vis,
         rigid_options=gs.options.RigidOptions(
             enable_joint_limit=False,
             enable_collision=False,
             gravity=(0, 0, -0),
         ),
+        show_viewer=args.vis,
     )
 
     ########################## entities ##########################

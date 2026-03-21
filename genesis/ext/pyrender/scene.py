@@ -7,13 +7,25 @@ Author: Matthew Matl
 import networkx as nx
 import numpy as np
 
-from genesis.ext import trimesh
-
 from .camera import Camera
 from .light import DirectionalLight, Light, PointLight, SpotLight
 from .mesh import Mesh
 from .node import Node
 from .utils import format_color_vector
+
+
+CORNER_INDICES = np.array(
+    [
+        [0, 1, 2],
+        [3, 1, 2],
+        [3, 4, 2],
+        [0, 4, 2],
+        [0, 1, 5],
+        [3, 1, 5],
+        [3, 4, 5],
+        [0, 4, 5],
+    ]
+)
 
 
 class Scene(object):
@@ -31,8 +43,7 @@ class Scene(object):
         The user-defined name of this object.
     """
 
-    def __init__(self, nodes=None, bg_color=None, ambient_light=None, name=None):
-
+    def __init__(self, nodes=None, bg_color=None, ambient_light=None, n_envs=None, name=None):
         if bg_color is None:
             bg_color = np.ones(4)
         else:
@@ -41,12 +52,16 @@ class Scene(object):
         if ambient_light is None:
             ambient_light = np.zeros(3)
 
+        if n_envs is None:
+            n_envs = 1
+
         if nodes is None:
             nodes = set()
         self._nodes = set()  # Will be added at the end of this function
 
         self.bg_color = bg_color
         self.ambient_light = ambient_light
+        self.n_envs = n_envs
         self.name = name
 
         self._name_to_nodes = {}
@@ -73,7 +88,7 @@ class Scene(object):
             for node in nodes:
                 for child in node.children:
                     if node_parent_map[child] is not None:
-                        raise ValueError("Nodes may not have more than " "one parent")
+                        raise ValueError("Nodes may not have more than one parent")
                     node_parent_map[child] = node
             for node in node_parent_map:
                 if node_parent_map[node] is None:
@@ -207,26 +222,23 @@ class Scene(object):
     def bounds(self):
         """(2,3) float : The axis-aligned bounds of the scene."""
         if self._bounds is None:
-            # Compute corners
             corners = []
             for mesh_node in self.mesh_nodes:
                 mesh = mesh_node.mesh
-                plane_flag = False
-                for primitive in mesh.primitives:
-                    if primitive.is_floor:
-                        plane_flag = True
-                        break
-                if plane_flag:
-                    continue
+                if any(primitive.is_floor for primitive in mesh.primitives):
+                    # Only take into account the centroid for floor plane
+                    corners_local = mesh.centroid[np.newaxis]
+                else:
+                    # corners_local = trimesh.bounds.corners(mesh.bounds)
+                    corners_local = mesh.bounds.reshape(-1)[CORNER_INDICES]
                 pose = self.get_pose(mesh_node)
-                corners_local = trimesh.bounds.corners(mesh.bounds)
-                corners_world = pose[:3, :3].dot(corners_local.T).T + pose[:3, 3]
+                corners_world = corners_local @ pose[:3, :3].T + pose[:3, 3]
                 corners.append(corners_world)
-            if len(corners) == 0:
-                self._bounds = np.zeros((2, 3))
+            if corners:
+                corners = np.concatenate(corners, axis=0)
+                self._bounds = np.stack((np.min(corners, axis=0), np.max(corners, axis=0)), axis=0)
             else:
-                corners = np.vstack(corners)
-                self._bounds = np.array([np.min(corners, axis=0), np.max(corners, axis=0)])
+                self._bounds = np.zeros((2, 3))
         return self._bounds
 
     @property
@@ -239,13 +251,12 @@ class Scene(object):
     @property
     def extents(self):
         """(3,) float : The lengths of the axes of the scene's AABB."""
-        return np.diff(self.bounds, axis=0).reshape(-1)
+        return self.bounds[1] - self.bounds[0]
 
     @property
     def scale(self):
         """(3,) float : The length of the diagonal of the scene's AABB."""
-        scale = np.linalg.norm(self.extents)
-        return scale
+        return max(np.linalg.norm(self.extents), 1e-7)
 
     def add(self, obj, name=None, pose=None, parent_node=None, parent_name=None):
         """Add an object (mesh, light, or camera) to the scene.
@@ -281,12 +292,14 @@ class Scene(object):
             raise TypeError("Unrecognized object type")
 
         if parent_node is None and parent_name is not None:
-            parent_nodes = self.get_nodes(name=parent_name)
-            if len(parent_nodes) == 0:
-                raise ValueError("No parent node with name {} found".format(parent_name))
-            elif len(parent_nodes) > 1:
-                raise ValueError("More than one parent node with name {} found".format(parent_name))
-            parent_node = list(parent_nodes)[0]
+            try:
+                (parent_node,) = self.get_nodes(name=parent_name)
+            except ValueError:
+                parent_nodes = self.get_nodes(name=parent_name)
+                if len(parent_nodes) == 0:
+                    raise ValueError(f"No parent node with name '{parent_name}' found")
+                elif len(parent_nodes) > 1:
+                    raise ValueError(f"More than one parent node with name '{parent_name}' found")
 
         self.add_node(node, parent_node=parent_node)
 
@@ -451,9 +464,9 @@ class Scene(object):
             self._path_cache[node] = path
 
         # Traverse from from_node to to_node
-        pose = np.eye(4)
-        for n in path[:-1]:
-            pose = np.dot(n.matrix, pose)
+        pose = path[0].matrix
+        for parent_node in path[1:-1]:
+            pose = np.dot(parent_node.matrix, pose)
 
         return pose
 
@@ -467,8 +480,6 @@ class Scene(object):
         pose : (4,4) float
             The pose to set the node to.
         """
-        # if node not in self.nodes:
-        #     raise ValueError('Node must already be in scene')
         node._matrix = pose
         if node.mesh is not None:
             self._bounds = None
@@ -589,7 +600,9 @@ class Scene(object):
         return scene_pr
 
     def sorted_mesh_nodes(self):
-        cam_loc = self.get_pose(self.main_camera_node)[:3, 3]
+        cam_pos = self.get_pose(self.main_camera_node)
+        cam_loc = cam_pos[..., :3, 3]
+        batched_pos = len(cam_pos.shape) == 3
         solid_nodes = []
         trans_nodes = []
         for node in self.mesh_nodes:
@@ -600,7 +613,12 @@ class Scene(object):
                 solid_nodes.append(node)
 
         # TODO BETTER SORTING METHOD
-        trans_nodes.sort(key=lambda n: -np.linalg.norm(self.get_pose(n)[:3, 3] - cam_loc))
-        solid_nodes.sort(key=lambda n: -np.linalg.norm(self.get_pose(n)[:3, 3] - cam_loc))
+        if batched_pos:
+            # FIXME normally sorting should be done PER scene when having a batched rasterizer render
+            trans_nodes.sort(key=lambda n: -np.linalg.norm(self.get_pose(n)[:3, 3] - cam_loc[0]))
+            solid_nodes.sort(key=lambda n: -np.linalg.norm(self.get_pose(n)[:3, 3] - cam_loc[0]))
+        else:
+            trans_nodes.sort(key=lambda n: -np.linalg.norm(self.get_pose(n)[:3, 3] - cam_loc))
+            solid_nodes.sort(key=lambda n: -np.linalg.norm(self.get_pose(n)[:3, 3] - cam_loc))
 
         return solid_nodes + trans_nodes

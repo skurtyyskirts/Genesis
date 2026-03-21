@@ -19,8 +19,13 @@
 
 ## 🔥 Nouveautés
 
-- [2024-12-25] Ajout d’un [docker](#docker) incluant la prise en charge du moteur de rendu par ray-tracing.
-- [2024-12-24] Ajout de directives pour [contribuer à Genesis](https://github.com/Genesis-Embodied-AI/Genesis/blob/main/CONTRIBUTING.md).
+  - [2025-08-05] Sortie de la v0.3.0 🎊 🎉
+  - [2025-07-02] Le développement de Genesis est désormais officiellement soutenu par [Genesis AI](https://genesis-ai.company/).
+  - [2025-01-09] Nous avons publié un [rapport détaillé d'analyse comparative des performances](https://github.com/zhouxian/genesis-speed-benchmark) de Genesis, accompagné de tous les scripts de test.
+  - [2025-01-08] Sortie de la v0.2.1 🎊 🎉
+  - [2025-01-08] Création des groupes [Discord](https://discord.gg/nukCuhB47p) et [Wechat](https://drive.google.com/uc?export=view&id=1ZS9nnbQ-t1IwkzJlENBYqYIIOOZhXuBZ).
+  - [2024-12-25] Ajout d’un [docker](https://www.google.com/search?q=%23docker) incluant la prise en charge du moteur de rendu par lancer de rayon (ray-tracing).
+  - [2024-12-24] Ajout de directives pour [contribuer à Genesis](https://github.com/Genesis-Embodied-AI/Genesis/blob/main/.github/contributing/PULL_REQUESTS.md).
 
 ## Table des Matières
 
@@ -61,47 +66,120 @@ Page du projet : <https://genesis-embodied-ai.github.io/>
 - **Compatibilité avec divers robots** : Bras robotiques, robots à pattes, drones, *robots mous*, et support pour charger `MJCF (.xml)`, `URDF`, `.obj`, `.glb`, `.ply`, `.stl`, et plus encore.
 - **Rendu photo-réaliste** : Rendu natif basé sur le lancer de rayons.
 - **Différentiabilité** : Genesis est conçu pour être entièrement différentiable. Actuellement, notre solveur MPM et Tool Solver prennent en charge la différentiabilité, avec d'autres solveurs prévus dans les prochaines versions (à commencer par le solveur de corps rigides et articulés).
-- **Simulation tactile basée sur la physique** : Simulation de capteur tactile différentiable [en cours de développement](https://github.com/Genesis-Embodied-AI/DiffTactile) (prévue pour la version 0.3.0).
 - **Facilité d'utilisation** : Conçu pour être simple, avec une installation intuitive et des API conviviales.
 
 ## Installation Rapide
 
-Genesis est disponible via PyPI :
+Installez d'abord **PyTorch** en suivant les [instructions officielles](https://pytorch.org/get-started/locally/).
+
+Ensuite, installez Genesis via PyPI :
 
 ```bash
-pip install genesis-world  # Nécessite Python >=3.9;
+pip install genesis-world  # Nécessite Python>=3.10,<3.14;
 ```
 
-Vous devez également installer **PyTorch** en suivant [les instructions officielles](https://pytorch.org/get-started/locally/).
+Pour obtenir la version la plus récente, assurez-vous que `pip` est à jour via `pip install --upgrade pip`, puis exécutez la commande :
 
-Pour la dernière version, clonez le dépôt et installez localement :
+```bash
+pip install git+https://github.com/Genesis-Embodied-AI/Genesis.git
+```
+
+Notez que le paquet doit toujours être mis à jour manuellement pour se synchroniser avec la branche principale (main).
+
+Les utilisateurs souhaitant modifier le code source de Genesis sont encouragés à l'installer en mode éditable. D'abord, assurez-vous que `genesis-world` a été désinstallé, puis clonez le dépôt et installez-le localement :
 
 ```bash
 git clone https://github.com/Genesis-Embodied-AI/Genesis.git
 cd Genesis
-pip install -e .
+pip install -e ".[dev]"
+```
+Il est recommandé d'exécuter systématiquement `pip install -e ".[dev]"` après avoir déplacé le HEAD pour s'assurer que toutes les dépendances et points d'entrée sont à jour.
+
+### Utiliser uv
+
+[uv](https://docs.astral.sh/uv/) est un gestionnaire de paquets et de projets Python rapide.
+
+**Installer uv :**
+```bash
+# Sur macOS et Linux
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Sur Windows
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
+**Démarrage rapide avec uv :**
+```bash
+git clone https://github.com/Genesis-Embodied-AI/Genesis.git
+cd Genesis
+uv sync
+```
+
+Ensuite, installez PyTorch pour votre plateforme :
+
+```bash
+# GPU NVIDIA (CUDA 12.6 par exemple)
+uv pip install torch --index-url https://download.pytorch.org/whl/cu126
+
+# CPU uniquement (Linux/Windows)
+uv pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+# Apple Silicon (Metal/MPS)
+uv pip install torch
+```
+
+Exécutez un exemple :
+```bash
+uv run examples/rigid/single_franka.py
 ```
 
 ## Docker
 
-Si vous souhaitez utiliser Genesis avec Docker, vous pouvez d'abord construire l'image Docker comme suit :
+Si vous souhaitez utiliser Genesis depuis Docker, vous pouvez d'abord construire l'image Docker comme suit :
 
 ```bash
 docker build -t genesis -f docker/Dockerfile docker
 ```
 
-Ensuite, vous pouvez exécuter les exemples à l'intérieur de l'image Docker (montés sur `/workspace/examples`) :
+Vous pouvez ensuite exécuter les exemples à l'intérieur de l'image Docker (montés dans `/workspace/examples`) :
 
 ```bash
 xhost +local:root # Autoriser le conteneur à accéder à l'affichage
 
 docker run --gpus all --rm -it \
 -e DISPLAY=$DISPLAY \
+-e LOCAL_USER_ID="$(id -u)" \
+-v /dev/dri:/dev/dri \
 -v /tmp/.X11-unix/:/tmp/.X11-unix \
--v $PWD:/workspace \
-genesis
+-v $(pwd):/workspace \
+--name genesis genesis:latest
+```
+
+### Utilisateurs AMD
+
+Les utilisateurs AMD peuvent utiliser Genesis avec le fichier `docker/Dockerfile.amdgpu`, qui se construit en exécutant :
 
 ```
+docker build -t genesis-amd -f docker/Dockerfile.amdgpu docker
+```
+
+et peut ensuite être utilisé en exécutant :
+
+```xhost +local:docker \
+docker run -it --network=host \
+ --device=/dev/kfd \
+ --device=/dev/dri \
+ --group-add=video \
+ --ipc=host \
+ --cap-add=SYS_PTRACE \
+ --security-opt seccomp=unconfined \
+ --shm-size 8G \
+ -v $PWD:/workspace \
+ -e DISPLAY=$DISPLAY \
+ genesis-amd
+```
+
+Les exemples seront accessibles depuis `/workspace/examples`. Note : Les utilisateurs AMD doivent utiliser le backend ROCm (HIP). Cela signifie que vous devrez appeler `gs.init(backend=gs.amdgpu)` pour initialiser Genesis.
 
 ## Documentation
 
@@ -115,7 +193,7 @@ Le projet Genesis est un effort ouvert et collaboratif. Nous accueillons toutes 
 - **Rapports de bugs** via GitHub Issues.
 - **Suggestions** pour améliorer la convivialité de Genesis.
 
-Consultez notre [guide de contribution](https://github.com/Genesis-Embodied-AI/Genesis/blob/main/CONTRIBUTING.md) pour plus de détails.
+Consultez notre [guide de contribution](https://github.com/Genesis-Embodied-AI/Genesis/blob/main/.github/contributing/PULL_REQUESTS.md) pour plus de détails.
 
 ## Support
 
@@ -168,9 +246,9 @@ Genesis est un projet à grande échelle qui intègre des technologies de pointe
 Si vous utilisez Genesis dans vos recherches, veuillez envisager de citer :
 
 ```bibtex
-@software{Genesis,
+@misc{Genesis,
   author = {Genesis Authors},
-  title = {Genesis: A Universal and Generative Physics Engine for Robotics and Beyond},
+  title = {Genesis: A Generative and Universal Physics Engine for Robotics and Beyond},
   month = {December},
   year = {2024},
   url = {https://github.com/Genesis-Embodied-AI/Genesis}

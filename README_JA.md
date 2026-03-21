@@ -19,8 +19,13 @@
 
 ## 🔥 最新情報
 
-- [2024-12-25] [レイトレーシングレンダラー](#docker)をサポートするDockerを追加しました。
-- [2024-12-24] [Genesisへの貢献方法](https://github.com/Genesis-Embodied-AI/Genesis/blob/main/CONTRIBUTING.md)に関するガイドラインを追加しました。
+  - [2025-08-05] v0.3.0をリリースしました 🎊 🎉
+  - [2025-07-02] Genesisの開発が、[Genesis AI](https://genesis-ai.company/)によって公式にサポートされることになりました。
+  - [2025-01-09] Genesisに関する[詳細なパフォーマンスベンチマークと比較レポート](https://github.com/zhouxian/genesis-speed-benchmark)を、すべてのテストスクリプトと共に公開しました。
+  - [2025-01-08] v0.2.1をリリースしました 🎊 🎉
+  - [2025-01-08] [Discord](https://discord.gg/nukCuhB47p)と[Wechat](https://drive.google.com/uc?export=view&id=1ZS9nnbQ-t1IwkzJlENBYqYIIOOZhXuBZ)のグループを作成しました。
+  - [2024-12-25] レイトレーシングレンダラーをサポートする[docker](https://www.google.com/search?q=%23docker)を追加しました。
+  - [2024-12-24] [Genesisへの貢献](https://github.com/Genesis-Embodied-AI/Genesis/blob/main/.github/contributing/PULL_REQUESTS.md)に関するガイドラインを追加しました。
 
 ## 目次
 
@@ -61,46 +66,121 @@ Genesisの目指すところ：
 - **様々なロボットへの対応**: ロボットアーム、脚付きロボット、ドローン、*ソフトロボット*など。また、`MJCF (.xml)`、`URDF`、`.obj`、`.glb`、`.ply`、`.stl`などの形式をサポート。
 - **フォトリアルなレンダリング**: レイトレーシングベースのレンダリングをネイティブでサポート。
 - **微分可能性**: 完全な微分可能性を備えた設計。現時点では、MPMソルバーとツールソルバーが対応しており、将来的には他のソルバーも対応予定（まず剛体および連結体ソルバーから開始）。
-- **物理ベースの触覚シミュレーション**: 微分可能な[触覚センサーシミュレーション](https://github.com/Genesis-Embodied-AI/DiffTactile)が近日公開予定（バージョン0.3.0を予定）。
 - **ユーザーフレンドリー**: シンプルで直感的なインストールとAPI設計。
 
 ## インストール
 
-GenesisはPyPIで利用可能です：
+まず[公式の手順](https://pytorch.org/get-started/locally/)に従って**PyTorch**をインストールしてください。
+
+次に、PyPI経由でGenesisをインストールします：
 
 ```bash
-pip install genesis-world  # Python >=3.9 が必要です;
+pip install genesis-world  # Python>=3.10,<3.14が必要です;
 ```
 
-また、**PyTorch**を[公式手順](https://pytorch.org/get-started/locally/)に従ってインストールする必要があります。
+最新バージョンを利用するには、`pip install --upgrade pip`で`pip`を更新してから、次のコマンドを実行してください：
 
-最新バージョンを利用するには、リポジトリをクローンしてローカルにインストールしてください：
+```bash
+pip install git+https://github.com/Genesis-Embodied-AI/Genesis.git
+```
+
+注意：mainブランチと同期するには、パッケージを手動で更新する必要があります。
+
+Genesisのソースコードを編集したいユーザーは、編集可能モードでGenesisをインストールすることを推奨します。まず、`genesis-world`がアンインストールされていることを確認し、リポジトリをクローンしてローカルにインストールします：
 
 ```bash
 git clone https://github.com/Genesis-Embodied-AI/Genesis.git
 cd Genesis
-pip install -e .
+pip install -e ".[dev]"
+```
+HEADを移動した後は、すべての依存関係とエントリーポイントが最新であることを確認するために、`pip install -e ".[dev]"` を体系的に実行することを推奨します。
+
+### uvを使用する場合
+
+[uv](https://docs.astral.sh/uv/) は高速なPythonパッケージ・プロジェクトマネージャーです。
+
+**uvのインストール：**
+```bash
+# macOSおよびLinux
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Windows
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
+**uvでクイックスタート：**
+```bash
+git clone https://github.com/Genesis-Embodied-AI/Genesis.git
+cd Genesis
+uv sync
+```
+
+次に、お使いのプラットフォーム向けにPyTorchをインストールします：
+
+```bash
+# NVIDIA GPU（例：CUDA 12.6）
+uv pip install torch --index-url https://download.pytorch.org/whl/cu126
+
+# CPUのみ（Linux/Windows）
+uv pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+# Apple Silicon（Metal/MPS）
+uv pip install torch
+```
+
+サンプルを実行：
+```bash
+uv run examples/rigid/single_franka.py
 ```
 
 ## Docker
 
-DockerからGenesisを利用する場合は、まずDockerイメージをビルドします：
+DockerからGenesisを使用したい場合は、まず次のようにしてDockerイメージをビルドできます：
 
 ```bash
 docker build -t genesis -f docker/Dockerfile docker
 ```
 
-その後、Dockerイメージ内で例を実行できます（`/workspace/examples`にマウント）：
+その後、Dockerイメージ内でサンプルを実行できます（`/workspace/examples`にマウントされます）：
 
 ```bash
-xhost +local:root # コンテナがディスプレイにアクセスできるようにする
+xhost +local:root # コンテナがディスプレイにアクセスすることを許可
 
 docker run --gpus all --rm -it \
 -e DISPLAY=$DISPLAY \
+-e LOCAL_USER_ID="$(id -u)" \
+-v /dev/dri:/dev/dri \
 -v /tmp/.X11-unix/:/tmp/.X11-unix \
--v $PWD:/workspace \
-genesis
+-v $(pwd):/workspace \
+--name genesis genesis:latest
 ```
+
+### AMDユーザー
+
+AMDユーザーは、`docker/Dockerfile.amdgpu`ファイルを使ってGenesisを利用できます。これは次のコマンドを実行してビルドします：
+
+```
+docker build -t genesis-amd -f docker/Dockerfile.amdgpu docker
+```
+
+ビルド後、次のコマンドを実行して使用できます：
+
+```
+xhost +local:docker \
+docker run -it --network=host \
+ --device=/dev/kfd \
+ --device=/dev/dri \
+ --group-add=video \
+ --ipc=host \
+ --cap-add=SYS_PTRACE \
+ --security-opt seccomp=unconfined \
+ --shm-size 8G \
+ -v $PWD:/workspace \
+ -e DISPLAY=$DISPLAY \
+ genesis-amd
+```
+
+サンプルは`/workspace/examples`からアクセス可能です。注意：AMDユーザーはROCm (HIP)バックエンドを使用してください。これは、Genesisを初期化するために`gs.init(backend=gs.amdgpu)`を呼び出す必要があることを意味します。
 
 ## ドキュメント
 
@@ -114,7 +194,7 @@ Genesisプロジェクトはオープンで協力的な取り組みです。以�
 - GitHub Issuesを通じた**バグ報告**。
 - Genesisの使いやすさを向上させるための**提案**。
 
-詳細は[貢献ガイド](https://github.com/Genesis-Embodied-AI/Genesis/blob/main/CONTRIBUTING.md)をご参照ください。
+詳細は[貢献ガイド](https://github.com/Genesis-Embodied-AI/Genesis/blob/main/.github/contributing/PULL_REQUESTS.md)をご参照ください。
 
 ## サポート
 
@@ -167,9 +247,9 @@ Genesisプロジェクトに関与した主要な研究論文の一覧：
 研究でGenesisを使用する場合、以下を引用してください：
 
 ```bibtex
-@software{Genesis,
+@misc{Genesis,
   author = {Genesis Authors},
-  title = {Genesis: A Universal and Generative Physics Engine for Robotics and Beyond},
+  title = {Genesis: A Generative and Universal Physics Engine for Robotics and Beyond},
   month = {December},
   year = {2024},
   url = {https://github.com/Genesis-Embodied-AI/Genesis}

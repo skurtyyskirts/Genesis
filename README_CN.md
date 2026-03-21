@@ -17,6 +17,16 @@
 
 # Genesis 通用物理引擎
 
+## 🔥 最新消息
+
+  - [2025-08-05] 发布 v0.3.0 🎊 🎉
+  - [2025-07-02] Genesis 的开发工作现已获得 [Genesis AI](https://genesis-ai.company/) 的官方支持。
+  - [2025-01-09] 我们发布了一份关于 Genesis 的[详细性能基准测试和比较报告](https://github.com/zhouxian/genesis-speed-benchmark)，并附上所有测试脚本。
+  - [2025-01-08] 发布 v0.2.1 🎊 🎉
+  - [2025-01-08] 创建了 [Discord](https://discord.gg/nukCuhB47p) 和 [微信](https://drive.google.com/uc?export=view&id=1ZS9nnbQ-t1IwkzJlENBYqYIIOOZhXuBZ) 社区群。
+  - [2024-12-25] 添加了支持光线追踪渲染器的 [docker](https://www.google.com/search?q=%23docker)。
+  - [2024-12-24] 添加了[为 Genesis 做贡献](https://github.com/Genesis-Embodied-AI/Genesis/blob/main/.github/contributing/PULL_REQUESTS.md)的指南。
+
 ## 目录
 
 1. [概述](#概述)
@@ -54,38 +64,121 @@ Genesis 是专为 *机器人/嵌入式 AI/物理 AI* 应用设计的通用物理
 - **支持广泛的机器人**：机器人手臂、腿式机器人、无人机、*软体机器人*等，并广泛支持加载不同文件类型：`MJCF (.xml)`、`URDF`、`.obj`、`.glb`、`.ply`、`.stl` 等。
 - **照片级真实感和高性能光线追踪器**：Genesis 支持基于光线追踪的原生渲染。
 - **可微分性**：Genesis 设计为完全兼容可微分模拟。目前，我们的 MPM 求解器和工具求解器是可微分的，其他求解器的可微分性将很快添加（从刚体模拟开始）。
-- **基于物理的触觉传感器**：Genesis 包含一个基于物理的可微分 [触觉传感器模拟模块](https://github.com/Genesis-Embodied-AI/DiffTactile)。这将很快集成到公共版本中（预计在 0.3.0 版本中）。
 - **用户友好性**：Genesis 设计为尽可能简化模拟的使用。从安装到 API 设计，如果有任何您觉得不直观或难以使用的地方，请 [告诉我们](https://github.com/Genesis-Embodied-AI/Genesis/issues)。
 
-## 快速入门
 
-### 安装
-首先按照[官方指南](https://pytorch.org/get-started/locally/)安装 PyTorch。
+## 快速安装
 
-然后可通过 PyPI 安装Genesis：
+首先，请根据[官方指南](https://pytorch.org/get-started/locally/)安装 **PyTorch**。
+
+然后，通过 PyPI 安装 Genesis：
+
 ```bash
-pip install genesis-world  # 需要 Python >=3.9
+pip install genesis-world  # 要求 Python>=3.10,<3.14;
 ```
 
-### Docker 支持
+要安装最新的版本，请先通过 `pip install --upgrade pip` 命令确保 `pip` 是最新版本，然后运行以下命令：
 
-如果您想通过 Docker 使用 Genesis，您可以首先构建 Docker 镜像，命令如下：
+```bash
+pip install git+https://github.com/Genesis-Embodied-AI/Genesis.git
+```
+
+请注意，您仍需手动更新此软件包以与主分支保持同步。
+
+如果用户希望编辑 Genesis 的源代码，我们鼓励以可编辑模式安装。首先，请确保已卸载 `genesis-world`，然后克隆代码仓库并在本地安装：
+
+```bash
+git clone https://github.com/Genesis-Embodied-AI/Genesis.git
+cd Genesis
+pip install -e ".[dev]"
+```
+建议在移动 HEAD 后系统地执行 `pip install -e ".[dev]"`，以确保所有依赖项和入口点都是最新的。
+
+### 使用 uv
+
+[uv](https://docs.astral.sh/uv/) 是一个快速的 Python 包和项目管理器。
+
+**安装 uv：**
+```bash
+# macOS 和 Linux
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Windows
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
+**使用 uv 快速开始：**
+```bash
+git clone https://github.com/Genesis-Embodied-AI/Genesis.git
+cd Genesis
+uv sync
+```
+
+然后为您的平台安装 PyTorch：
+
+```bash
+# NVIDIA GPU（以 CUDA 12.6 为例）
+uv pip install torch --index-url https://download.pytorch.org/whl/cu126
+
+# 仅 CPU（Linux/Windows）
+uv pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+# Apple Silicon（Metal/MPS）
+uv pip install torch
+```
+
+运行示例：
+```bash
+uv run examples/rigid/single_franka.py
+```
+
+## Docker
+
+如果您希望通过 Docker 使用 Genesis，可以先像这样构建 Docker 镜像：
 
 ```bash
 docker build -t genesis -f docker/Dockerfile docker
 ```
 
-然后，您可以在 Docker 镜像内运行示例代码（挂载到 `/workspace/examples`）：
+然后您可以在 Docker 镜像中运行示例（示例文件挂载于 `/workspace/examples`）：
 
 ```bash
-xhost +local:root # 允许容器访问显示器
+xhost +local:root # 允许容器访问显示设备
 
 docker run --gpus all --rm -it \
 -e DISPLAY=$DISPLAY \
+-e LOCAL_USER_ID="$(id -u)" \
+-v /dev/dri:/dev/dri \
 -v /tmp/.X11-unix/:/tmp/.X11-unix \
--v $PWD:/workspace \
-genesis
+-v $(pwd):/workspace \
+--name genesis genesis:latest
 ```
+
+### AMD 用户
+
+AMD 用户可以使用 `docker/Dockerfile.amdgpu` 文件来使用 Genesis，该文件可通过运行以下命令构建：
+
+```
+docker build -t genesis-amd -f docker/Dockerfile.amdgpu docker
+```
+
+然后通过运行以下命令来使用：
+
+```xhost +local:docker \
+docker run -it --network=host \
+ --device=/dev/kfd \
+ --device=/dev/dri \
+ --group-add=video \
+ --ipc=host \
+ --cap-add=SYS_PTRACE \
+ --security-opt seccomp=unconfined \
+ --shm-size 8G \
+ -v $PWD:/workspace \
+ -e DISPLAY=$DISPLAY \
+ genesis-amd
+```
+
+示例文件将可以在 `/workspace/examples` 目录下找到。注意：AMD 用户应使用 ROCm (HIP) 后端。这意味着您需要调用 `gs.init(backend=gs.amdgpu)` 来初始化 Genesis。
 
 ### 文档
 
@@ -151,9 +244,9 @@ Genesis 是一个大规模的努力，将各种现有和正在进行的研究工
 如果您在研究中使用了 Genesis，我们将非常感谢您引用它。我们仍在撰写技术报告，在其公开之前，您可以考虑引用：
 
 ```bibtex
-@software{Genesis,
+@misc{Genesis,
   author = {Genesis Authors},
-  title = {Genesis: A Universal and Generative Physics Engine for Robotics and Beyond},
+  title = {Genesis: A Generative and Universal Physics Engine for Robotics and Beyond},
   month = {December},
   year = {2024},
   url = {https://github.com/Genesis-Embodied-AI/Genesis}

@@ -6,13 +6,12 @@ import genesis as gs
 
 
 def main():
-
     parser = argparse.ArgumentParser()
     parser.add_argument("-v", "--vis", action="store_true", default=False)
     args = parser.parse_args()
 
     ########################## init ##########################
-    gs.init(seed=0, precision="32", logging_level="debug")
+    gs.init(precision="32", logging_level="info")
     np.set_printoptions(precision=7, suppress=True)
 
     ########################## create a scene ##########################
@@ -23,12 +22,12 @@ def main():
             camera_fov=40,
             max_FPS=200,
         ),
-        show_viewer=args.vis,
         rigid_options=gs.options.RigidOptions(
             enable_joint_limit=False,
             enable_collision=False,
             gravity=(0, 0, -0),
         ),
+        show_viewer=args.vis,
     )
 
     ########################## entities ##########################
@@ -48,7 +47,7 @@ def main():
     )
 
     ########################## build ##########################
-    n_envs = 100
+    n_envs = 64
     scene.build(n_envs=n_envs, env_spacing=(1.0, 1.0))
 
     target_quat = np.tile(np.array([0, 1, 0, 0]), [n_envs, 1])  # pointing downwards
@@ -58,7 +57,7 @@ def main():
 
     ee_link = robot.get_link("hand")
 
-    for i in range(0, 2000):
+    for i in range(720):
         target_pos = np.zeros([n_envs, 3])
         target_pos[:, 0] = center[:, 0] + np.cos(i / 360 * np.pi * angular_speed) * r
         target_pos[:, 1] = center[:, 1] + np.sin(i / 360 * np.pi * angular_speed) * r

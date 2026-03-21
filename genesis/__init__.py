@@ -1,256 +1,494 @@
-# import taichi while suppressing its output
-from unittest.mock import patch
-
-_ti_outputs = []
-
-
-def fake_print(*args, **kwargs):
-    output = "".join(args)
-    _ti_outputs.append(output)
-
-
-with patch("builtins.print", fake_print):
-    import taichi as ti
-
+import io
 import os
 import sys
-import torch
 import atexit
+import logging as _logging
 import traceback
+import weakref
+from typing import Callable
+from warnings import warn
+from contextlib import redirect_stdout
+
+# Import quadrants while collecting its output without printing directly
+_qd_outputs = io.StringIO()
+
+os.environ.setdefault("QD_ENABLE_PYBUF", "0" if sys.stdout is sys.__stdout__ else "1")
+
+with redirect_stdout(_qd_outputs):
+    import quadrants as qd
+
+try:
+    import torch
+except ImportError as e:
+    raise ImportError(
+        "'torch' module not available. Please install pytorch manually: https://pytorch.org/get-started/locally/"
+    ) from e
 import numpy as np
 
-from .constants import GS_ARCH, TI_ARCH
-from .constants import backend as gs_backend
+from .constants import backend as _gs_backend
 from .logging import Logger
 from .version import __version__
-from .utils import set_random_seed, get_platform, get_cpu_device, get_gpu_device
+from .utils import redirect_libc_stderr, set_random_seed, get_device
 
-_initialized = False
-backend = None
-first_init = True
-exit_callbacks = []
-global_scene_list = set()
+
+_IS_OLD_TORCH = tuple(map(int, torch.__version__.split(".")[:2])) < (2, 8)
+# FIXME: qd.Field does not support zero-copy on Metal for 'torch<=2.9.1'.
+# See: https://github.com/pytorch/pytorch/pull/168193
+_TORCH_MPS_SUPPORT_DLPACK_FIELD = tuple(map(int, torch.__version__.replace("+", ".").split(".")[:3])) > (2, 9, 1)
+if _IS_OLD_TORCH:
+    warn("'torch<2.8.0' is not supported. Please upgrade pytorch manually: https://pytorch.org/get-started/locally/")
+
+
+# Global state
+_initialized: bool = False
+_scene_registry: list[weakref.ReferenceType["Scene"]] = []
+_module_registry: set[tuple[Callable[[], None], Callable[[], None]]] = set()
+_theme: str | None = None
+logger: Logger | None = None
+device: torch.device | None = None
+backend: _gs_backend | None = None
+use_ndarray: bool | None = None
+use_fastcache: bool | None = None
+use_zerocopy: bool | None = None
+EPS: float | None = None
 
 
 ########################## init ##########################
 def init(
-    seed=None,
+    *,
+    backend=None,
     precision="32",
-    debug=False,
-    eps=1e-12,
     logging_level=None,
-    backend=gs_backend.gpu,
+    debug=False,
+    seed=None,
+    eps=1e-15,
     theme="dark",
     logger_verbose_time=False,
+    performance_mode=False,
 ):
-
-    # genesis._initialized
     global _initialized
     if _initialized:
         raise_exception("Genesis already initialized.")
-    _initialized = True
 
-    # genesis._theme
-    if theme not in ["dark", "light", "dumb"]:
-        raise_exception(f"Unsupported theme: {theme}")
+    # Make sure everything is properly destroyed, just in case initialization failed previously
+    destroy()
+
+    # Update theme if valid
     global _theme
+    if theme not in ("dark", "light", "dumb"):
+        raise_exception(f"Unsupported theme: ~~<{theme}>~~")
     _theme = theme
 
-    # verbose repr
-    global _verbose
-    _verbose = False
-
-    # genesis.logger
-    global logger
-    global first_init
-    if first_init:
-        logger = Logger(logging_level, debug, logger_verbose_time)
-        atexit.register(_gs_exit)
-
-        # greeting message
-        _display_greeting(logger.INFO_length)
-
-        first_init = False
-
-    # get default device and compute total device memory
-    global platform
-    global device
-    platform = get_platform()
-    if backend == gs_backend.cpu:
-        device, device_name, total_mem = get_cpu_device()
-    else:
-        device, device_name, total_mem = get_gpu_device()
-
-    # genesis.backend
-    if backend not in GS_ARCH[platform]:
-        raise_exception(f"backend ~~<{backend}>~~ not supported for platform ~~<{platform}>~~")
-    backend = GS_ARCH[platform][backend]
-    _globalize_backend(backend)
-
-    logger.info(
-        f"Running on ~~<[{device_name}]>~~ with backend ~~<{backend}>~~. Device memory: ~~<{total_mem:.2f}>~~ GB."
-    )
-
-    # init taichi
-    with patch("builtins.print", fake_print):
-        # force_scalarize_matrix=True for speeding up kernel compilation
-        ti.init(arch=TI_ARCH[platform][backend], debug=debug, force_scalarize_matrix=True)
-
-    for ti_output in _ti_outputs:
-        logger.debug(ti_output)
-
-    # dtype
-    global ti_float
-    global np_float
-    global tc_float
-    if precision == "32":
-        ti_float = ti.f32
-        np_float = np.float32
-        tc_float = torch.float32
-    elif precision == "64":
-        ti_float = ti.f64
-        np_float = np.float64
-        tc_float = torch.float64
-    else:
+    # Make sure that specified arch and precision are supported
+    if precision not in ("32", "64"):
         raise_exception(f"Unsupported precision type: ~~<{precision}>~~")
 
-    # All int uses 32-bit precision, unless under special circumstances.
-    global ti_int
-    global np_int
-    global tc_int
-    ti_int = ti.i32
-    np_int = np.int32
-    tc_int = torch.int32
+    # Get device and backend
+    global device
+    if backend is None and debug:
+        backend_candidates = [_gs_backend.cpu]
+    elif backend is None or backend == _gs_backend.gpu:
+        backend_candidates = [_gs_backend.cuda, _gs_backend.amdgpu, _gs_backend.metal, _gs_backend.cpu]
+    else:
+        backend_candidates = [backend]
+    while backend_candidates:
+        _backend = backend_candidates.pop(0)
+        if os.environ.get(f"QD_ENABLE_{_backend.name.upper()}", "1") == "0":
+            continue
+        try:
+            device, device_name, total_mem, _backend = get_device(_backend)
+            is_cpu_fallback = backend == _gs_backend.gpu and _backend == _gs_backend.cpu
+            backend = _backend
+            break
+        except GenesisException as e:
+            if not backend_candidates:
+                raise_exception_from(f"Backend ~~<{_backend}>~~ not available on this machine.", e)
+    globals()["backend"] = backend
 
-    # let's use GLSL convention: https://learnwebgl.brown37.net/12_shader_language/glsl_data_types.html
-    global ti_vec2
-    ti_vec2 = ti.types.vector(2, ti_float)
-    global ti_vec3
-    ti_vec3 = ti.types.vector(3, ti_float)
-    global ti_vec4
-    ti_vec4 = ti.types.vector(4, ti_float)
-    global ti_vec6
-    ti_vec6 = ti.types.vector(6, ti_float)
-    global ti_vec7
-    ti_vec7 = ti.types.vector(7, ti_float)
-    global ti_mat3
-    ti_mat3 = ti.types.matrix(3, 3, ti_float)
-    global ti_mat4
-    ti_mat4 = ti.types.matrix(4, 4, ti_float)
-    global ti_ivec2
-    ti_ivec2 = ti.types.vector(2, ti_int)
-    global ti_ivec3
-    ti_ivec3 = ti.types.vector(3, ti_int)
-    global ti_ivec4
-    ti_ivec4 = ti.types.vector(4, ti_int)
+    # Fallback to Torch CPU device if requested
+    if backend != _gs_backend.cpu and os.environ.get("GS_TORCH_FORCE_CPU_DEVICE") == "1":
+        device, device_name, total_mem, _backend = get_device(_gs_backend.cpu)
 
-    global EPS
-    EPS = eps
+    # Initialize the logger and print greeting message
+    global logger
+    if logging_level is None:
+        logging_level = _logging.DEBUG if debug else _logging.INFO
+    logger = Logger(logging_level, logger_verbose_time)
 
-    # seed
-    if seed is not None:
-        global SEED
-        SEED = seed
-        set_random_seed(SEED)
-
-    global exit_callbacks
-    exit_callbacks = []
-
-    logger.info(
-        f"🚀 Genesis initialized. 🔖 version: ~~<{__version__}>~~, 🌱 seed: ~~<{seed}>~~, 📏 precision: '~~<{precision}>~~', 🐛 debug: ~~<{debug}>~~, 🎨 theme: '~~<{theme}>~~'."
-    )
-
-
-########################## init ##########################
-def destroy():
-    """
-    A simple wrapper for ti.reset(). This call releases all gpu memories allocated and destroyes all runtime data, and also forces caching of compiled kernels.
-    gs.init() needs to be called again to reinitialize the system after destroy.
-    """
-    # genesis._initialized
-    global _initialized
-    _initialized = False
-    ti.reset()
-
-    global global_scene_list
-    for scene in global_scene_list:
-        if scene._visualizer is not None:
-            if scene._visualizer._rasterizer is not None:
-                scene._visualizer._rasterizer.destroy()
-    global_scene_list.clear()
-
-
-def _globalize_backend(_backend):
-    global backend
-    backend = _backend
-
-
-def _display_greeting(INFO_length):
     try:
-        terminal_size = os.get_terminal_size()[0]
-    except OSError as e:
-        terminal_size = 80
-    wave_width = int((terminal_size - INFO_length - 11) / 2)
+        columns, _lines = os.get_terminal_size()
+    except OSError:
+        columns = 80
+    wave_width = (columns - logger.INFO_length - 11) // 2
     if wave_width % 2 == 0:
         wave_width -= 1
     wave_width = max(0, min(38, wave_width))
     bar_width = wave_width * 2 + 9
     wave = ("┈┉" * wave_width)[:wave_width]
-    logger.info(f"~<╭{'─'*(bar_width)}╮>~")
+    logger.info(f"~<╭{'─' * (bar_width)}╮>~")
     logger.info(f"~<│{wave}>~ ~~~~<Genesis>~~~~ ~<{wave}│>~")
-    logger.info(f"~<╰{'─'*(bar_width)}╯>~")
+    logger.info(f"~<╰{'─' * (bar_width)}╯>~")
+
+    if is_cpu_fallback:
+        logger.warning(f"Backend ~~<{backend}>~~ not available on this machine. Falling back to CPU.")
+
+    # Configure Quadrants fast cache and array type
+    global use_ndarray, use_fastcache, use_zerocopy
+    is_ndarray_disabled = os.environ.get("GS_ENABLE_NDARRAY", "1") == "0"
+    if use_ndarray is None:
+        _use_ndarray = not (is_ndarray_disabled or performance_mode)
+    else:
+        _use_ndarray = use_ndarray
+        if _use_ndarray and is_ndarray_disabled:
+            raise_exception("Genesis previous initialized. Quadrants dynamic array mode cannot be disabled anymore.")
+    is_fastcache_disabled = os.environ.get("GS_ENABLE_FASTCACHE", "1") == "0"
+    if use_fastcache is None:
+        _use_fastcache = not is_fastcache_disabled and _use_ndarray
+    else:
+        _use_fastcache = use_fastcache
+        if use_fastcache and is_fastcache_disabled:
+            raise_exception("Genesis previous initialized. Quadrants fast cache mode cannot be disabled anymore.")
+    use_ndarray, use_fastcache = _use_ndarray, _use_fastcache
+
+    # Unlike dynamic vs static array mode, and fastcache, zero-copy can be toggle on/off between init without issue
+    _use_zerocopy = bool(int(os.environ["GS_ENABLE_ZEROCOPY"])) if "GS_ENABLE_ZEROCOPY" in os.environ else None
+    if _use_zerocopy:
+        if backend == _gs_backend.metal and not _use_ndarray and not _TORCH_MPS_SUPPORT_DLPACK_FIELD:
+            raise_exception("Zero-copy not supported for static array mode on Apple Metal if 'torch<=2.9.1'.")
+        if (backend == _gs_backend.metal and device.type != "mps") or (
+            backend in (_gs_backend.cuda, _gs_backend.amdgpu) and device.type != "cuda"
+        ):
+            raise_exception(
+                f"Genesis backend '{backend}' not consistent with Torch device type '{device.type}'. Zero-copy "
+                "not supported."
+            )
+
+    if (
+        (backend == gs.cpu and device.type == "cpu")
+        or (backend in (_gs_backend.cuda, _gs_backend.amdgpu) and device.type == "cuda")
+        or (backend == _gs_backend.metal and device.type == "mps" and (_use_ndarray or _TORCH_MPS_SUPPORT_DLPACK_FIELD))
+    ):
+        if _use_zerocopy is None:
+            _use_zerocopy = True
+    else:
+        if _use_zerocopy:
+            raise_exception(f"Zero-copy not supported on {backend} backend.")
+    use_zerocopy = bool(_use_zerocopy)
+
+    # Define the right dtypes in accordance with selected backend and precision
+    global qd_float, np_float, tc_float
+    if precision == "32":
+        qd_float = qd.f32
+        np_float = np.float32
+        tc_float = torch.float32
+    else:  # precision == "64":
+        if backend == _gs_backend.metal:
+            raise_exception("64bits precision is not supported on Apple Metal GPU.")
+        qd_float = qd.f64
+        np_float = np.float64
+        tc_float = torch.float64
+
+    # All int uses 32-bit precision, unless under special circumstances
+    global qd_int, np_int, tc_int
+    qd_int = qd.i32
+    np_int = np.int32
+    tc_int = torch.int32
+
+    # Bool
+    # Note that `qd.u1` is broken on Apple Metal.
+    global qd_bool, np_bool, tc_bool
+    if backend == _gs_backend.metal:
+        qd_bool = qd.i32
+        np_bool = np.int32
+        tc_bool = torch.int32
+    else:
+        qd_bool = qd.u1
+        np_bool = np.bool_
+        tc_bool = torch.bool
+
+    # Let's use GLSL convention: https://learnwebgl.brown37.net/12_shader_language/glsl_data_types.html
+    global qd_vec2, qd_vec3, qd_vec4, qd_vec6, qd_vec7, qd_vec11, qd_mat3, qd_mat4, qd_ivec2, qd_ivec3, qd_ivec4
+    qd_vec2 = qd.types.vector(2, qd_float)
+    qd_vec3 = qd.types.vector(3, qd_float)
+    qd_vec4 = qd.types.vector(4, qd_float)
+    qd_vec6 = qd.types.vector(6, qd_float)
+    qd_vec7 = qd.types.vector(7, qd_float)
+    qd_vec11 = qd.types.vector(11, qd_float)
+    qd_mat3 = qd.types.matrix(3, 3, qd_float)
+    qd_mat4 = qd.types.matrix(4, 4, qd_float)
+    qd_ivec2 = qd.types.vector(2, qd_int)
+    qd_ivec3 = qd.types.vector(3, qd_int)
+    qd_ivec4 = qd.types.vector(4, qd_int)
+
+    # Update torch default dtype and device, just in case
+    torch.set_default_device(device)
+    torch.set_default_dtype(tc_float)
+
+    # Define smallest float that is considered non-zero
+    global EPS
+    EPS = float(max(eps, np.finfo(np_float).eps))
+
+    # Configure and initialize quadrants
+    qd_init_kwargs = {}
+    if logger.level == _logging.CRITICAL:
+        qd_init_kwargs.update(log_level=qd.ERROR)
+    elif logger.level == _logging.ERROR:
+        qd_init_kwargs.update(log_level=qd.ERROR)
+    elif logger.level == _logging.WARNING:
+        qd_init_kwargs.update(log_level=qd.WARN)
+    elif logger.level == _logging.INFO:
+        qd_init_kwargs.update(log_level=qd.WARN)
+    elif logger.level == _logging.DEBUG:
+        qd_init_kwargs.update(log_level=qd.INFO)
+    if debug:
+        if backend != _gs_backend.cpu:
+            logger.warning("Debug mode is partially supported for GPU backend.")
+        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+        torch.use_deterministic_algorithms(True)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        logger.info("Beware running Genesis in debug mode dramatically reduces runtime speed.")
+
+    # FIXME: Enforcing Quadrants num threads to 1 by default when running on CPU
+    # because it significantly improve performance.
+    qd_num_cpu_threads = os.environ.get("QD_NUM_THREADS")
+    if qd_num_cpu_threads is not None:
+        qd_init_kwargs.update(
+            cpu_max_num_threads=int(qd_num_cpu_threads),
+            num_compile_threads=int(qd_num_cpu_threads),
+        )
+    else:
+        qd_init_kwargs.update(
+            cpu_max_num_threads=1,
+        )
+
+    if seed is not None:
+        global SEED
+        SEED = seed
+        set_random_seed(SEED)
+        qd_init_kwargs.update(
+            random_seed=seed,
+        )
+
+    # init quadrants
+    qd_debug = debug and (os.environ.get("QD_DEBUG") != "0")
+    with redirect_stdout(_qd_outputs):
+        qd.init(
+            arch=getattr(qd, backend.name),
+            enable_fallback=False,
+            # Add a (hidden) mechanism to forcible disable Quadrants debug mode as it is still a bit experimental
+            debug=qd_debug and backend == _gs_backend.cpu,
+            check_out_of_bound=debug and backend != _gs_backend.metal,
+            # force_scalarize_matrix=True for speeding up kernel compilation
+            # FIXME: Turning off 'force_scalarize_matrix' is causing numerical instabilities ('nan') on MacOS
+            force_scalarize_matrix=True,
+            # FIXME: Turning off 'advanced_optimization' is causing issues on MacOS
+            advanced_optimization=True,
+            # This improves runtime speed by around 1%-5%, while it makes compilation up to 6x slower
+            cfg_optimization=False,
+            fast_math=not debug,
+            default_ip=qd_int,
+            default_fp=qd_float,
+            unrolling_limit=100,  # This threshold needs to be increased to accommodate gradient computation
+            **qd_init_kwargs,
+        )
+
+    # Disable debug checks for quadrants
+    qd.lang._template_mapper.__builtins__["__debug__"] = qd_debug
+
+    logger.info(
+        f"Running on ~~<[{device_name}]>~~ with backend ~~<{backend}>~~. Device memory: ~~<{total_mem:.2f}>~~ GB."
+    )
+
+    for qd_output in _qd_outputs.getvalue().splitlines():
+        logger.debug(qd_output)
+    _qd_outputs.truncate(0)
+    _qd_outputs.seek(0)
+
+    # Redirect Quadrants logging messages to unify logging management
+    for qd_name, gs_name in (
+        ("debug", "debug"),
+        ("trace", "debug"),
+        ("info", "debug"),
+        ("warn", "info"),
+        ("error", "warning"),
+        ("critical", "error"),
+    ):
+        setattr(qd._logging, qd_name, getattr(logger, gs_name))
+
+    # Dealing with default backend
+    if use_fastcache:
+        logger.debug("[Quadrants] Enabling pure kernels for fast cache mode.")
+    if use_ndarray:
+        logger.debug("[Quadrants] Enabling Quadrants dynamic array type to avoid scene-specific compilation.")
+    if backend == _gs_backend.amdgpu:
+        logger.debug("[Quadrants] Beware AMD GPU backend is still experimental and may be unstable.")
+
+    if _IS_OLD_TORCH:
+        logger.warning(
+            "'torch<2.8.0' is not supported. Please upgrade pytorch manually: https://pytorch.org/get-started/locally/"
+        )
+    elif backend == _gs_backend.metal and not _TORCH_MPS_SUPPORT_DLPACK_FIELD:
+        logger.warning(
+            "'torch<2.9.1' does not supported zero-copy on Apple Metal. Consider upgrading pytorch to improve "
+            "runtime performance: https://pytorch.org/get-started/locally/"
+        )
+
+    msg_options = ", ".join(
+        f"{name}: ~~<{val}>~~"
+        for name, val in (
+            ("🔖 version", __version__),
+            ("🎨 theme", theme),
+            ("🌱 seed", seed),
+            ("🐛 debug", debug),
+            ("📏 precision", precision),
+            ("🔥 performance", performance_mode),
+            ("💬 verbose", _logging.getLevelName(logger.level)),
+        )
+    )
+    logger.info(f"🚀 Genesis initialized. {msg_options}")
+
+    if _use_zerocopy is None:
+        logger.warning(
+            "Zero-copy mode not enabled because Genesis backend is not supported or Torch device is not consistent "
+            "with it. This will reduce performance."
+        )
+
+    atexit.register(destroy)
+    _initialized = True
+
+    # Initialize all externally registered modules
+    for init_fun, _destroy_fun in _module_registry:
+        init_fun()
 
 
-def set_verbose(verbose):
-    global _verbose
-    _verbose = verbose
+########################## destroy ##########################
+
+
+def destroy():
+    """
+    This call destroys all scenes, releasing all gpu memories allocated and runtime data, then forces caching of
+    compiled kernels.
+
+    Note that gs.init() needs to be called again to re-initialize Genesis after destroy.
+    """
+    # Early return if not initialized
+    global _initialized
+    if not _initialized:
+        return
+
+    # Do not consider Genesis as initialized at this point
+    _initialized = False
+
+    # Unregister at-exit callback that is not longer relevant.
+    # This is important when `init` / `destroy` is called multiple times, which is typically the case for unit tests.
+    atexit.unregister(destroy)
+
+    # Display any buffered error message if logger is configured
+    global logger
+    if logger:
+        logger.info("💤 Exiting Genesis and caching compiled kernels...")
+
+    # Destroy all scenes
+    global _scene_registry
+    for scene_ref in _scene_registry.copy():
+        scene = scene_ref()
+        assert scene is not None
+        scene.destroy()
+
+    # Destroy all externally registered modules
+    for _init_fun, destroy_fun in _module_registry:
+        destroy_fun()
+
+    # Reset Quadrants
+    qd.reset()
+
+    # Restore original Quadrants logging facilities
+    for qd_name, qd_level in (
+        ("debug", qd._logging.DEBUG),
+        ("trace", qd._logging.TRACE),
+        ("info", qd._logging.INFO),
+        ("warn", qd._logging.WARN),
+        ("error", qd._logging.ERROR),
+        ("critical", qd._logging.CRITICAL),
+    ):
+        setattr(qd._logging, qd_name, qd._logging._get_logging(qd_level))
+
+    # Delete logger
+    logger.removeHandler(logger.handler)
+    logger = None
+
+    # Clear global state
+    global _theme, device, backend, EPS
+    _theme = None
+    device = None
+    backend = None
+    EPS = None
+
+
+####################### External module registration hook #######################
+
+
+def register_external_module(init_fun: Callable[[], None], destroy_fun: Callable[[], None]) -> None:
+    assert isinstance(init_fun, Callable) and isinstance(destroy_fun, Callable)
+    _module_registry.add((init_fun, destroy_fun))
+
+    # Call init right away if Genesis is already initialized
+    if gs._initialized:
+        init_fun()
+
+
+def unregister_external_module(init_fun: Callable[[], None], destroy_fun: Callable[[], None]) -> None:
+    assert isinstance(init_fun, Callable) and isinstance(destroy_fun, Callable)
+    _module_registry.remove((init_fun, destroy_fun))
 
 
 ########################## Exception and exit handling ##########################
 
 
 class GenesisException(Exception):
-    def __init__(self, message):
-        self.message = message
-        super().__init__(self.message)
+    pass
 
 
 def _custom_excepthook(exctype, value, tb):
-    if issubclass(exctype, GenesisException):
-        # We don't want the traceback info to trace till this __init__.py file.
-        stack_trace = "".join(traceback.format_exception(exctype, value, tb)[:-2])
-        print(stack_trace)
-    else:
-        # Use the system's default excepthook for other exception types
-        sys.__excepthook__(exctype, value, tb)
+    print("".join(traceback.format_exception(exctype, value, tb)))
+
+    # Log the exception right before exit if possible
+    global logger
+    try:
+        logger.error(f"{exctype.__name__}: {value}")
+    except (AttributeError, NameError):
+        # Logger may not be configured at this point
+        pass
 
 
 # Set the custom excepthook to handle GenesisException
 sys.excepthook = _custom_excepthook
 
+########################## shortcut imports for users ##########################
 
-def _gs_exit():
-    # display error if it exists
-    if logger._error_msg is not None:
-        logger.error(logger._error_msg)
+from .ext import _trimesh_patch
+from .utils.misc import get_src_dir as _get_src_dir
 
-    # This might raise error during unit test
+with open(os.devnull, "w") as stderr, redirect_libc_stderr(stderr):
     try:
-        logger.info("💤 Exiting Genesis and caching compiled kernels...")
-    except:
+        from pygel3d import graph, hmesh
+    except OSError as e:
+        # Import may fail because of missing system dependencies (libGLU.so.1).
+        # This is not blocking because it is only an issue for hybrid entities.
         pass
 
-    for cb in exit_callbacks:
-        cb()
+    try:
+        sys.path.append(os.path.join(_get_src_dir(), "ext/LuisaRender/build/bin"))
+        import LuisaRenderPy as _LuisaRenderPy
+    except ImportError:
+        pass
 
-    destroy()
-
-
-########################## shortcut imports for users ##########################
 from .constants import (
     IntEnum,
     JOINT_TYPE,
     GEOM_TYPE,
+    EQUALITY_TYPE,
     CTRL_MODE,
     PARA_LEVEL,
     ACTIVE,
@@ -262,9 +500,10 @@ from .constants import (
 from .utils.uid import UID
 from .utils import tools
 from .utils.geom import *
-from .utils.misc import assert_built, assert_unbuilt, assert_initialized, raise_exception
+from .utils.misc import assert_built, assert_unbuilt, assert_initialized, raise_exception, raise_exception_from
 
 from .options import morphs
+from .options import sensors
 from .options import renderers
 from .options import surfaces
 from .options import textures
@@ -273,9 +512,10 @@ from .datatypes import List
 from .grad.creation_ops import *
 
 from .engine import states, materials, force_fields
-from .engine.scene import Scene
 from .engine.mesh import Mesh
-from .engine.entities.emitter import Emitter
+from .engine.scene import Scene
 
-for name, member in gs_backend.__members__.items():
+from . import recorders
+
+for name, member in _gs_backend.__members__.items():
     globals()[name] = member

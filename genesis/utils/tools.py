@@ -1,10 +1,9 @@
 import inspect
 import os
-import threading
 import time
 
 import numpy as np
-import taichi as ti
+import quadrants as qd
 from PIL import Image
 
 import genesis as gs
@@ -26,10 +25,10 @@ def animate(imgs, filename=None, fps=60):
     if filename is None:
         caller_file = inspect.stack()[-1].filename
         # caller file + timestamp + .mp4
-        filename = os.path.splitext(os.path.basename(caller_file))[0] + f'_{time.strftime("%Y%m%d_%H%M%S")}.mp4'
+        filename = os.path.splitext(os.path.basename(caller_file))[0] + f"_{time.strftime('%Y%m%d_%H%M%S')}.mp4"
     os.makedirs(os.path.abspath(os.path.dirname(filename)), exist_ok=True)
 
-    gs.logger.info(f"Saving video to ~<{filename}>~.")
+    gs.logger.info(f'Saving video to ~<"{filename}">~...')
     from moviepy import ImageSequenceClip
 
     imgs = ImageSequenceClip(imgs, fps=fps)
@@ -39,7 +38,7 @@ def animate(imgs, filename=None, fps=60):
         logger=None,
         codec="libx264",
         preset="ultrafast",
-        ffmpeg_params=["-crf", "0"],
+        # ffmpeg_params=["-crf", "0"],
     )
     gs.logger.info("Video saved.")
 
@@ -53,26 +52,32 @@ def save_img_arr(arr, filename="img.png"):
 
 
 class Timer:
-    def __init__(self, skip=False, level=0, ti_sync=False):
+    def __init__(self, skip=False, level=0, qd_sync=False):
         self.accu_log = dict()
         self.skip = skip
         self.level = level
-        self.ti_sync = ti_sync
+        self.qd_sync = qd_sync
         self.msg_width = 0
         self.reset()
 
     def reset(self):
         self.just_reset = True
         if self.level == 0 and not self.skip:
-            print("─" * os.get_terminal_size()[0])
+            try:
+                column, _lines = os.get_terminal_size()
+            except OSError:
+                column = 80
+            print("─" * column)
+        if self.qd_sync and not self.skip:
+            qd.sync()
         self.prev_time = self.init_time = time.perf_counter()
 
     def _stamp(self, msg="", _ratio=1.0):
         if self.skip:
             return
 
-        if self.ti_sync:
-            ti.sync()
+        if self.qd_sync:
+            qd.sync()
 
         self.cur_time = time.perf_counter()
         self.msg_width = max(self.msg_width, len(msg))
@@ -96,7 +101,7 @@ class Timer:
             prefix = ""
 
         print(
-            f"{prefix}[{msg.ljust(self.msg_width)}] step: {step_time:5.3f}ms | accu: {accu_time:5.3f}ms | step_avg: {self.accu_log[msg][1]/self.accu_log[msg][0]:5.3f}ms | accu_avg: {self.accu_log[msg][2]/self.accu_log[msg][0]:5.3f}ms"
+            f"{prefix}[{msg.ljust(self.msg_width)}] step: {step_time:5.3f}ms | accu: {accu_time:5.3f}ms | step_avg: {self.accu_log[msg][1] / self.accu_log[msg][0]:5.3f}ms | accu_avg: {self.accu_log[msg][2] / self.accu_log[msg][0]:5.3f}ms"
         )
 
         self.prev_time = time.perf_counter()
@@ -107,8 +112,8 @@ class Timer:
         if self.skip:
             return
 
-        if self.ti_sync:
-            ti.sync()
+        if self.qd_sync:
+            qd.sync()
 
         self.cur_time = time.perf_counter()
         self.msg_width = max(self.msg_width, len(msg))
@@ -132,7 +137,7 @@ class Timer:
             prefix = ""
 
         print(
-            f"{prefix}[{msg.ljust(self.msg_width)}] step: {step_time:5.3f}ms | accu: {accu_time:5.3f}ms | step_avg: {self.accu_log[msg][1]/self.accu_log[msg][0]:5.3f}ms | accu_avg: {self.accu_log[msg][2]/self.accu_log[msg][0]:5.3f}ms"
+            f"{prefix}[{msg.ljust(self.msg_width)}] step: {step_time:5.3f}ms | accu: {accu_time:5.3f}ms | step_avg: {self.accu_log[msg][1] / self.accu_log[msg][0]:5.3f}ms | accu_avg: {self.accu_log[msg][2] / self.accu_log[msg][0]:5.3f}ms"
         )
 
         self.prev_time = time.perf_counter()
@@ -142,7 +147,7 @@ class Timer:
 timers = dict()
 
 
-def create_timer(name=None, new=False, level=0, ti_sync=False, skip_first_call=False):
+def create_timer(name=None, new=False, level=0, qd_sync=False, skip_first_call=False):
     if name is None:
         return Timer()
     else:
@@ -152,7 +157,7 @@ def create_timer(name=None, new=False, level=0, ti_sync=False, skip_first_call=F
             timer.reset()
             return timer
         else:
-            timer = Timer(skip=skip_first_call, level=level, ti_sync=ti_sync)
+            timer = Timer(skip=skip_first_call, level=level, qd_sync=qd_sync)
             timers[name] = timer
             return timer
 
@@ -171,18 +176,46 @@ class Rate:
 
 
 class FPSTracker:
-    def __init__(self, n_envs, alpha=0.95, compensate_logging_cost=True):
-        self.last_time = time.perf_counter()
+    def __init__(
+        self, n_envs, alpha=0.95, minimum_interval_seconds: float | None = 0.05, outlier_threshold: float = 1.5
+    ):
+        self.last_time = None
         self.n_envs = n_envs
-        self.dt = 0
+        self.dt_ema = None
         self.alpha = alpha
-        self.compensate_logging_cost = compensate_logging_cost
+        self.minimum_interval_seconds = minimum_interval_seconds
+        self.outlier_threshold = outlier_threshold
+        self.steps_since_last_print: int = 0
+        self.total_fps = 0.0
 
-    def step(self):
-        current_time = time.perf_counter()
-        dt = current_time - self.last_time
-        self.dt = self.alpha * self.dt + (1 - self.alpha) * dt
-        fps = 1 / self.dt
+    def step(self, current_time: float | None = None) -> float | None:
+        if not current_time:
+            current_time = time.perf_counter()
+
+        if self.last_time:
+            dt = current_time - self.last_time
+        else:
+            self.last_time = current_time
+            return None
+
+        self.steps_since_last_print += 1
+
+        # Skip if update is too soon
+        if self.minimum_interval_seconds and current_time - self.last_time < self.minimum_interval_seconds:
+            return None
+
+        # Outlier rejection
+        if self.dt_ema is not None:
+            if dt > self.dt_ema * self.outlier_threshold or dt * self.outlier_threshold < self.dt_ema:
+                self.dt_ema = dt
+
+        # EMA update
+        if self.dt_ema:
+            self.dt_ema = self.alpha * self.dt_ema + (1 - self.alpha) * dt
+        else:
+            self.dt_ema = dt
+
+        fps = 1 / self.dt_ema * self.steps_since_last_print
         if self.n_envs > 0:
             self.total_fps = fps * self.n_envs
             gs.logger.info(
@@ -191,17 +224,6 @@ class FPSTracker:
         else:
             self.total_fps = fps
             gs.logger.info(f"Running at ~<{fps:.2f}>~ FPS.")
-        if self.compensate_logging_cost:  # skip logging cost
-            self.last_time = time.perf_counter()
-        else:
-            self.last_time = current_time
-
-
-def run_in_another_thread(fn, args):
-    """
-    Use this for running simulation loop in order to use viewer in non-linux system
-    """
-    if gs.platform == "Linux":
-        gs.raise_exception("Use this only for non-linux system")
-
-    threading.Thread(target=fn, args=args).start()
+        self.last_time = current_time
+        self.steps_since_last_print = 0
+        return self.total_fps

@@ -1,15 +1,14 @@
-"""OpenGL shader program wrapper.
-"""
+"""OpenGL shader program wrapper."""
 
-import numpy as np
+import numbers
 import os
 import re
 
+import numpy as np
+
 import OpenGL
 from OpenGL.GL import *
-from OpenGL.platform import ctypesloader
 from OpenGL.GL import shaders as gl_shader_utils
-from time import time
 
 func = None
 
@@ -67,8 +66,11 @@ class ShaderProgramCache(object):
 
     def clear(self):
         for key in self._program_cache:
-            self._program_cache[key].delete()
-        self._program_cache = {}
+            try:
+                self._program_cache[key].delete()
+            except OpenGL.error.GLError:
+                pass
+        self._program_cache.clear()
 
 
 class ShaderProgram(object):
@@ -88,7 +90,6 @@ class ShaderProgram(object):
     """
 
     def __init__(self, vertex_shader, fragment_shader, geometry_shader=None, defines=None):
-
         self.vertex_shader = vertex_shader
         self.fragment_shader = fragment_shader
         self.geometry_shader = geometry_shader
@@ -132,8 +133,11 @@ class ShaderProgram(object):
 
     def _remove_from_context(self):
         if self._program_id is not None:
-            glDeleteProgram(self._program_id)
-            glDeleteVertexArrays(1, [self._vao_id])
+            try:
+                glDeleteProgram(self._program_id)
+                glDeleteVertexArrays(1, [self._vao_id])
+            except OpenGL.error.Error:
+                pass
             self._program_id = None
             self._vao_id = None
 
@@ -205,28 +209,22 @@ class ShaderProgram(object):
             # self._unif_map[name] = value.size, value.shape
             if value.ndim == 1:
                 if np.issubdtype(value.dtype, np.unsignedinteger) or unsigned:
-                    dtype = "u"
-                    value = value.astype(np.uint32)
+                    value = np.ascontiguousarray(value, np.uint32)
                 elif np.issubdtype(value.dtype, np.integer):
-                    dtype = "i"
-                    value = value.astype(np.int32)
+                    value = np.ascontiguousarray(value, dtype=np.int32)
                 else:
-                    dtype = "f"
-                    value = value.astype(np.float32)
-                self._FUNC_MAP[(value.shape[0], dtype)](loc, 1, value)
+                    value = np.ascontiguousarray(value, dtype=np.float32)
+                func = self._FUNC_MAP[(len(value), value.dtype.kind)]
+                func(loc, 1, value)
             else:
-                func1 = self._FUNC_MAP[(value.shape[0], value.shape[1])]
-                func1(loc, 1, GL_TRUE, value)
+                value = np.ascontiguousarray(value, dtype=np.float32)
+                func = self._FUNC_MAP[tuple(value.shape[:2])]
+                func(loc, 1, GL_TRUE, value)
 
         # Call correct uniform function
-        elif isinstance(value, float):
-            glUniform1f(loc, value)
-        elif isinstance(value, int):
-            if unsigned:
-                glUniform1ui(loc, value)
-            else:
-                glUniform1i(loc, value)
-        elif isinstance(value, bool):
+        elif isinstance(value, (numbers.Real, np.floating)):
+            glUniform1f(loc, float(value))
+        elif isinstance(value, (numbers.Integral, np.integer)):
             if unsigned:
                 glUniform1ui(loc, int(value))
             else:

@@ -1,7 +1,6 @@
+import os
 import argparse
-
 import numpy as np
-
 import genesis as gs
 
 
@@ -11,7 +10,7 @@ def main():
     args = parser.parse_args()
 
     ########################## init ##########################
-    gs.init(seed=0, precision="32", logging_level="debug")
+    gs.init(precision="32", logging_level="info")
 
     ########################## create a scene ##########################
 
@@ -34,6 +33,7 @@ def main():
         show_viewer=args.vis,
         vis_options=gs.options.VisOptions(
             visualize_mpm_boundary=True,
+            rendered_envs_idx=[0],
         ),
     )
 
@@ -88,25 +88,24 @@ def main():
             color=(0.0, 0.4, 0.9, 1.0),
         ),
     )
-    scene.build()
+    scene.build(n_envs=0)
 
-    horizon = 1000
+    horizon = 100 if "PYTEST_VERSION" not in os.environ else 5
     for i in range(horizon):
-        if i < 500:
-            emitter1.emit(
-                pos=np.array([0.16, -0.4, 0.5]),
-                direction=np.array([0.0, 0.0, -1.0]),
-                speed=1.5,
-                droplet_shape="circle",
-                droplet_size=0.16,
-            )
-            emitter2.emit(
-                pos=np.array([-0.16, -0.4, 0.5]),
-                direction=np.array([0.0, 0.0, -1.0]),
-                speed=1.5,
-                droplet_shape="circle",
-                droplet_size=0.16,
-            )
+        emitter1.emit(
+            pos=np.array([0.16, -0.4, 0.5]),
+            direction=np.array([0.0, 0.0, -1.0]),
+            speed=1.5,
+            droplet_shape="circle",
+            droplet_size=0.16,
+        )
+        emitter2.emit(
+            pos=np.array([-0.16, -0.4, 0.5]),
+            direction=np.array([0.0, 0.0, -1.0]),
+            speed=1.5,
+            droplet_shape="circle",
+            droplet_size=0.16,
+        )
         scene.step()
 
 

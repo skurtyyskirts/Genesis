@@ -1,22 +1,11 @@
 import hashlib
 import os
-import pickle as pkl
 import time
 from itertools import combinations
 
-import matplotlib.pyplot as plt
 import networkx as nx
 import numpy as np
 from matplotlib.patches import FancyArrowPatch
-from mpl_toolkits.mplot3d import proj3d
-
-try:
-    from pygel3d import graph, hmesh
-
-    is_pygel3d_available = True
-except Exception as e:
-    pygel3d_error_msg = f"{e.__class__.__name__}: {e}"
-    is_pygel3d_available = False
 
 import genesis as gs
 
@@ -24,9 +13,15 @@ from .misc import get_gel_cache_dir
 
 
 def load_hmesh(fpath: str):
-    if not is_pygel3d_available:
-        gs.raise_exception(f"Failed to import pygel3d. {pygel3d_error_msg}")
+    from pygel3d import hmesh
+
     return hmesh.load(fpath)
+
+
+def trimesh_to_gelmesh(tmesh):
+    from pygel3d import hmesh
+
+    return hmesh.Manifold.from_triangles(vertices=tmesh.vertices, faces=tmesh.faces)
 
 
 def get_gel_path(positions, nodes, sampling):
@@ -37,19 +32,9 @@ def get_gel_path(positions, nodes, sampling):
     return os.path.join(get_gel_cache_dir(), f"{hasher.hexdigest()}.gel")
 
 
-def trimesh_to_gelmesh(tmesh):
-    if not is_pygel3d_available:
-        gs.raise_exception(f"Failed to import pygel3d. {pygel3d_error_msg}")
-    gelmesh = hmesh.Manifold.from_triangles(
-        vertices=tmesh.vertices,
-        faces=tmesh.faces,
-    )
-    return gelmesh
-
-
 def skeletonization(mesh, sampling=True, verbose=False):
-    if not is_pygel3d_available:
-        gs.raise_exception(f"Failed to import pygel3d. {pygel3d_error_msg}")
+    from pygel3d import hmesh, graph
+
     assert isinstance(mesh, hmesh.Manifold), "The input mesh of skeletonization should be pygel3d.hmesh.Manifold"
     g = graph.from_mesh(mesh)
     if verbose:
@@ -59,14 +44,14 @@ def skeletonization(mesh, sampling=True, verbose=False):
         gs.logger.debug("Skeleton (`.gel`) found in cache.")
         graph_gel = graph.load(gel_file_path)
     else:
-        with gs.logger.timer(f"Convert mesh to skeleton:"):
+        with gs.logger.timer("Convert mesh to skeleton:"):
             graph_gel = graph.LS_skeleton(g, sampling=sampling)
 
         os.makedirs(os.path.dirname(gel_file_path), exist_ok=True)
         graph.save(gel_file_path, graph_gel)
     if verbose:
         toc = time.time()
-        print(f"Skeletonization time {toc-tic}")
+        print(f"Skeletonization time {toc - tic}")
 
     return graph_gel
 
@@ -112,11 +97,11 @@ def reduce_graph(G, straight_thresh=10):
         path = nx.shortest_path(
             G, source=ref_node, target=node
         )  # NOTE: if there is loop, we pick shortest path to the reference node
-        node_curr = ref_node
+        node_cur = ref_node
         for node_on_path in path:
             if node_on_path in G_reduced.nodes():
-                G_reduced.add_edge(node_curr, node_on_path)
-                node_curr = node_on_path
+                G_reduced.add_edge(node_cur, node_on_path)
+                node_cur = node_on_path
 
     return G_reduced
 
@@ -220,6 +205,9 @@ class Arrow3D(FancyArrowPatch):
         self._verts3d = xs, ys, zs
 
     def do_3d_projection(self, renderer=None):
+        # Importing mpl_toolkits is very slow and not used very often. Let's delay import.
+        from mpl_toolkits.mplot3d import proj3d
+
         xs3d, ys3d, zs3d = self._verts3d
         xs, ys, zs = proj3d.proj_transform(xs3d, ys3d, zs3d, self.axes.M)
         self.set_positions((xs[0], ys[0]), (xs[1], ys[1]))
@@ -238,6 +226,9 @@ def plot_nxgraph(
     node_size=100,
     plot_node_num=True,
 ):
+    # Importing matplotlib is very slow and not used very often. Let's delay import.
+    import matplotlib.pyplot as plt
+
     if pos is None:
         pos = nx.spring_layout(G, dim=3, seed=779)
 

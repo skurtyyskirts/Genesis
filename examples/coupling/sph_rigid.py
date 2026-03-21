@@ -1,4 +1,5 @@
 import argparse
+import os
 
 import genesis as gs
 
@@ -9,7 +10,7 @@ def main():
     args = parser.parse_args()
 
     ########################## init ##########################
-    gs.init(seed=0, precision="32", logging_level="debug")
+    gs.init(precision="32", logging_level="info")
 
     ########################## create a scene ##########################
 
@@ -24,6 +25,7 @@ def main():
         ),
         vis_options=gs.options.VisOptions(
             visualize_sph_boundary=True,
+            rendered_envs_idx=[0],
         ),
         viewer_options=gs.options.ViewerOptions(
             camera_pos=(3.5, -3.15, 2.42),
@@ -63,7 +65,8 @@ def main():
     ########################## build ##########################
     scene.build()
 
-    for i in range(500):
+    horizon = 500 if "PYTEST_VERSION" not in os.environ else 5
+    for i in range(horizon):
         scene.step()
 
 

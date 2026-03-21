@@ -2,9 +2,11 @@ logs/
 tmp/
 MUJOCO_LOG.TXT
 imgui.ini
+.polyscope.ini
 .DS_Store
 sftp-config.json
 *.mp4
+genesis/assets/terrain/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -12,7 +14,13 @@ __pycache__/
 *$py.class
 
 # C extensions
+*.pyc
+*.pyd
 *.so
+*.o
+simplify.c
+_simplify.cpp
+_replay.cpp
 
 # Distribution / packaging
 .Python
@@ -62,6 +70,7 @@ coverage.xml
 *.py,cover
 .hypothesis/
 .pytest_cache/
+__snapshots__
 
 # Translations
 *.mo
@@ -141,3 +150,7 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+uv.lock
+
+# alarm.yml outputs
+outputs/

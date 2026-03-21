@@ -1,33 +1,23 @@
-import numpy as np
-import taichi as ti
-from scipy.spatial import KDTree
-
-import genesis as gs
-import genesis.utils.geom as gu
-import genesis.utils.mesh as mu
-from genesis.engine.entities.base_entity import Entity
 from genesis.engine.entities.particle_entity import ParticleEntity
-from genesis.ext import trimesh
 
 
-@ti.data_oriented
 class SFParticleEntity(ParticleEntity):
     """
     PBD-based entity represented solely by particles.
     """
 
-    def __init__(self, scene, solver, material, morph, surface, particle_size, idx, particle_start):
+    def __init__(
+        self, scene, solver, material, morph, surface, particle_size, idx, particle_start, name: str | None = None
+    ):
         super().__init__(
-            scene, solver, material, morph, surface, particle_size, idx, particle_start, need_skinning=False
+            scene, solver, material, morph, surface, particle_size, idx, particle_start, need_skinning=False, name=name
         )
 
-    def process_input(self, in_backward=False):
-        # TODO: implement this
+    def _add_particles_to_solver(self):
+        # Nothing to add here because particles in SF are purely for visualization
         pass
 
-    def _add_to_solver_(self):
-        # particles in SF is purely for visualization
-        # it doesn't make sense to add here
+    def process_input(self, in_backward=False):
         pass
 
     def sample(self):
@@ -35,4 +25,11 @@ class SFParticleEntity(ParticleEntity):
 
     def update_particles(self, particles):
         self._particles = particles
-        self._n_particles = particles.shape[0]
+        self._n_particles = len(particles)
+
+    # ------------------------------------------------------------------------------------
+    # --------------------------------- naming methods -----------------------------------
+    # ------------------------------------------------------------------------------------
+
+    def _get_morph_identifier(self) -> str:
+        return f"sf_{super()._get_morph_identifier()}"

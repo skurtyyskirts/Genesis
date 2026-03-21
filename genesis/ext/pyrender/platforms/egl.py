@@ -3,7 +3,10 @@ import os
 
 import OpenGL.platform
 
+import genesis as gs
+
 from .base import Platform
+
 
 EGL_PLATFORM_DEVICE_EXT = 0x313F
 EGL_DRM_DEVICE_FILE_EXT = 0x3233
@@ -81,12 +84,11 @@ def get_device_by_index(device_id):
 
     devices = query_devices()
     if device_id >= len(devices):
-        raise ValueError("Invalid device ID ({})".format(device_id, len(devices)))
+        raise ValueError("Invalid device ID ({}) with {} devices".format(device_id, len(devices)))
     return devices[device_id]
 
 
 class EGLDevice:
-
     def __init__(self, display=None):
         self._display = display
 
@@ -114,20 +116,20 @@ class EGLDevice:
 class EGLPlatform(Platform):
     """Renders using EGL."""
 
-    def __init__(self, viewport_width, viewport_height, device: EGLDevice = None):
-        super(EGLPlatform, self).__init__(viewport_width, viewport_height)
-        if device is None:
-            device = get_default_device()
-
-        self._egl_device = device
+    def __init__(self, viewport_width, viewport_height, device_id: int | None = None):
+        super().__init__(viewport_width, viewport_height)
+        if _eglQueryDevicesEXT is None and device_id not in (0, None):
+            raise RuntimeError("EGL platform plugin is not available. Enforcing specific EGL device not supported.")
+        self._egl_device_id = device_id
+        self._egl_device = None
         self._egl_display = None
         self._egl_context = None
 
     def init_context(self):
         _ensure_egl_loaded()
-
         from OpenGL.EGL import (
             EGL_SURFACE_TYPE,
+            EGL_NO_SURFACE,
             EGL_PBUFFER_BIT,
             EGL_BLUE_SIZE,
             EGL_RED_SIZE,
@@ -139,19 +141,19 @@ class EGLPlatform(Platform):
             EGL_OPENGL_BIT,
             EGL_CONFORMANT,
             EGL_NONE,
-            EGL_DEFAULT_DISPLAY,
             EGL_NO_CONTEXT,
             EGL_OPENGL_API,
             EGL_CONTEXT_MAJOR_VERSION,
             EGL_CONTEXT_MINOR_VERSION,
             EGL_CONTEXT_OPENGL_PROFILE_MASK,
             EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
-            eglGetDisplay,
             eglInitialize,
             eglChooseConfig,
             eglBindAPI,
             eglCreateContext,
+            eglMakeCurrent,
             EGLConfig,
+            EGLError,
         )
         from OpenGL import arrays
 
@@ -191,25 +193,61 @@ class EGLPlatform(Platform):
         num_configs = ctypes.c_long()
         configs = (EGLConfig * 1)()
 
-        # Cache DISPLAY if necessary and get an off-screen EGL display
-        orig_dpy = None
-        if "DISPLAY" in os.environ:
-            orig_dpy = os.environ["DISPLAY"]
-            del os.environ["DISPLAY"]
+        # Get the list of devices to try on
+        if _eglQueryDevicesEXT is None:
+            all_devices = (EGLDevice(None),)
+        else:
+            all_devices = query_devices()
+        if _eglQueryDevicesEXT is None or self._egl_device_id is None:
+            devices = all_devices
+        else:
+            devices = (get_device_by_index(self._egl_device_id),)
 
-        self._egl_display = self._egl_device.get_display()
-        if orig_dpy is not None:
-            os.environ["DISPLAY"] = orig_dpy
+        # Get the first EGL device that is working
+        error = None
+        for i, device in enumerate(devices):
+            gs.logger.debug(f"Trying to create EGL Context for EGL_DEVICE_ID='{self._egl_device_id or i}'...")
 
-        # Initialize EGL
-        assert eglInitialize(self._egl_display, major, minor)
-        assert eglChooseConfig(self._egl_display, config_attributes, configs, 1, num_configs)
+            # Cache DISPLAY if necessary and get an off-screen EGL display
+            orig_dpy = None
+            if "DISPLAY" in os.environ:
+                orig_dpy = os.environ["DISPLAY"]
+                del os.environ["DISPLAY"]
 
-        # Bind EGL to the OpenGL API
-        assert eglBindAPI(EGL_OPENGL_API)
+            egl_display = device.get_display()
+            if orig_dpy is not None:
+                os.environ["DISPLAY"] = orig_dpy
 
-        # Create an EGL context
-        self._egl_context = eglCreateContext(self._egl_display, configs[0], EGL_NO_CONTEXT, context_attributes)
+            try:
+                # Initialize EGL
+                assert eglInitialize(egl_display, major, minor)
+
+                # Configure EGL
+                assert eglChooseConfig(egl_display, config_attributes, configs, 1, num_configs)
+
+                # Bind EGL to the OpenGL API
+                assert eglBindAPI(EGL_OPENGL_API)
+
+                # Create an EGL context
+                egl_context = eglCreateContext(egl_display, configs[0], EGL_NO_CONTEXT, context_attributes)
+
+                # Select EGL context
+                assert eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, egl_context)
+
+                break
+            except (AssertionError, EGLError) as e:
+                error = e
+        else:
+            if self._egl_device_id is None:
+                err_msg = "No EGL context could be initialized."
+            else:
+                err_msg = f"No EGL context could not be initialized for EGL_DEVICE_ID='{self._egl_device_id or i}'."
+            raise EGLError(err_msg) from error
+
+        # Backup the device and display that will be used
+        self._egl_device = device
+        self._egl_display = egl_display
+        self._egl_context = egl_context
 
         # Make it current
         self.make_current()

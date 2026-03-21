@@ -12,7 +12,7 @@ def main():
     args = parser.parse_args()
 
     ########################## init ##########################
-    gs.init(seed=0, precision="32", logging_level="debug")
+    gs.init(precision="32", logging_level="info")
 
     ########################## create a scene ##########################
     scene = gs.Scene(
@@ -22,11 +22,11 @@ def main():
             camera_fov=40,
             max_FPS=200,
         ),
-        show_viewer=args.vis,
         rigid_options=gs.options.RigidOptions(
             dt=0.01,
             constraint_solver=gs.constraint_solver.Newton,
         ),
+        show_viewer=args.vis,
     )
 
     ########################## entities ##########################
@@ -46,18 +46,29 @@ def main():
     ########################## domain randomization ##########################
     robot.set_friction_ratio(
         friction_ratio=0.5 + torch.rand(scene.n_envs, robot.n_links),
-        link_indices=np.arange(0, robot.n_links),
+        links_idx_local=np.arange(0, robot.n_links),
     )
+
+    # set mass of a single link
+    link = robot.get_link("RR_thigh")
+    rigid = scene.sim.rigid_solver
+    ori_mass = rigid.links_info.inertial_mass.to_numpy()
+    print("original mass", link.get_mass(), ori_mass)
+    link.set_mass(1)
+    new_mass = rigid.links_info.inertial_mass.to_numpy()
+    print("diff mass", new_mass - ori_mass)
+
     robot.set_mass_shift(
         mass_shift=-0.5 + torch.rand(scene.n_envs, robot.n_links),
-        link_indices=np.arange(0, robot.n_links),
+        links_idx_local=np.arange(0, robot.n_links),
     )
     robot.set_COM_shift(
         com_shift=-0.05 + 0.1 * torch.rand(scene.n_envs, robot.n_links, 3),
-        link_indices=np.arange(0, robot.n_links),
+        links_idx_local=np.arange(0, robot.n_links),
     )
+    aabb = robot.get_AABB()
 
-    joint_names = [
+    joints_name = (
         "FR_hip_joint",
         "FR_thigh_joint",
         "FR_calf_joint",
@@ -70,31 +81,17 @@ def main():
         "RL_hip_joint",
         "RL_thigh_joint",
         "RL_calf_joint",
-    ]
-    motor_dofs = [robot.get_joint(name).dof_idx_local for name in joint_names]
-
-    robot.set_dofs_kp(np.full(12, 20), motor_dofs)
-    robot.set_dofs_kv(np.full(12, 1), motor_dofs)
-    default_dof_pos = np.array(
-        [
-            0.0,
-            0.8,
-            -1.5,
-            0.0,
-            0.8,
-            -1.5,
-            0.0,
-            1.0,
-            -1.5,
-            0.0,
-            1.0,
-            -1.5,
-        ]
     )
-    robot.control_dofs_position(default_dof_pos, motor_dofs)
+    motors_dof_idx = [robot.get_joint(name).dofs_idx_local[0] for name in joints_name]
 
-    for i in range(1000):
-        scene.step()
+    robot.set_dofs_kp(np.full(12, 20), motors_dof_idx)
+    robot.set_dofs_kv(np.full(12, 1), motors_dof_idx)
+    default_dof_pos = np.array([0.0, 0.8, -1.5, 0.0, 0.8, -1.5, 0.0, 1.0, -1.5, 0.0, 1.0, -1.5])
+    # padding to n_env x n_dofs
+    default_dof_pos = np.tile(default_dof_pos, (n_envs, 1))
+    robot.control_dofs_position(default_dof_pos, motors_dof_idx)
+
+    scene.step()
 
 
 if __name__ == "__main__":

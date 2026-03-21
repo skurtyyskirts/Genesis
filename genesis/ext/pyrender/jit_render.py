@@ -1,19 +1,18 @@
+import os
+
 import numpy as np
-from numba import *
-from numba.extending import intrinsic
+import numba as nb
+
 import OpenGL.GL as GL
 import OpenGL.constant as GL_constant
-from OpenGL.GL import GLint, GLuint, GLvoidp, GLvoid, GLfloat, GLsizei, GLboolean, GLenum, GLsizeiptr, GLintptr
+
 from .material import MetallicRoughnessMaterial, SpecularGlossinessMaterial
 from .light import DirectionalLight, PointLight
 from .constants import RenderFlags, MAX_N_LIGHTS
-from time import time
 from .numba_gl_wrapper import GLWrapper
 
-import os
-import genesis as gs
 
-os.environ["NUMBA_CACHE_DIR"] = os.path.join(gs.utils.misc.get_cache_dir(), "numba")
+_DISABLE_OFFSCREEN_MARKERS = "GS_DISABLE_OFFSCREEN_MARKERS" in os.environ
 
 
 def load_const(const_name):
@@ -60,74 +59,75 @@ RenderFlags_SKIP_CULL_FACES = RenderFlags.SKIP_CULL_FACES
 RenderFlags_SHADOWS_DIRECTIONAL = RenderFlags.SHADOWS_DIRECTIONAL
 RenderFlags_SHADOWS_POINT = RenderFlags.SHADOWS_POINT
 RenderFlags_SKIP_FLOOR = RenderFlags.SKIP_FLOOR
+RenderFlags_OFFSCREEN = RenderFlags.OFFSCREEN
 RenderFlags_REFLECTIVE_FLOOR = RenderFlags.REFLECTIVE_FLOOR
 RenderFlags_FLAT = RenderFlags.FLAT
 
 
-@njit
-def str_to_ptr(s):
-    n = len(s)
+@nb.jit(nopython=True, cache=True)
+def get_uniform_location(pid, name, gl):
+    n = len(name)
     arr = np.zeros(n + 1, np.uint8)
     for i in range(n):
-        arr[i] = ord(s[i])
-    return address_to_ptr(arr.ctypes.data)
+        arr[i] = ord(name[i])
+    return gl.glGetUniformLocation(pid, arr.ctypes.data)
 
 
-@njit
+@nb.jit(nopython=True, cache=True)
 def set_uniform_matrix_4fv(pid, name, value, gl):
-    loc = gl.glGetUniformLocation(pid, str_to_ptr(name))
+    loc = get_uniform_location(pid, name, gl)
     if loc >= 0:
         gl.glUniformMatrix4fv(loc, 1, GL_TRUE, address_to_ptr(value.ctypes.data))
     else:
         print("uniform not found:", name)
 
 
-@njit
+@nb.jit(nopython=True, cache=True)
 def set_uniform_1i(pid, name, value, gl):
-    loc = gl.glGetUniformLocation(pid, str_to_ptr(name))
+    loc = get_uniform_location(pid, name, gl)
     if loc >= 0:
         gl.glUniform1i(loc, value)
     else:
         print("uniform not found:", name)
 
 
-@njit
+@nb.jit(nopython=True, cache=True)
 def set_uniform_1f(pid, name, value, gl):
-    loc = gl.glGetUniformLocation(pid, str_to_ptr(name))
+    loc = get_uniform_location(pid, name, gl)
     if loc >= 0:
         gl.glUniform1f(loc, value)
     else:
         print("uniform not found:", name)
 
 
-@njit
+@nb.jit(nopython=True, cache=True)
 def set_uniform_2f(pid, name, value1, value2, gl):
-    loc = gl.glGetUniformLocation(pid, str_to_ptr(name))
+    loc = get_uniform_location(pid, name, gl)
     if loc >= 0:
         gl.glUniform2f(loc, value1, value2)
     else:
         print("uniform not found:", name)
 
 
-@njit
+@nb.jit(nopython=True, cache=True)
 def set_uniform_3fv(pid, name, value, gl):
-    loc = gl.glGetUniformLocation(pid, str_to_ptr(name))
+    loc = get_uniform_location(pid, name, gl)
     if loc >= 0:
         gl.glUniform3fv(loc, 1, address_to_ptr(value.ctypes.data))
     else:
         print("uniform not found:", name)
 
 
-@njit
+@nb.jit(nopython=True, cache=True)
 def set_uniform_4fv(pid, name, value, gl):
-    loc = gl.glGetUniformLocation(pid, str_to_ptr(name))
+    loc = get_uniform_location(pid, name, gl)
     if loc >= 0:
         gl.glUniform4fv(loc, 1, address_to_ptr(value.ctypes.data))
     else:
         print("uniform not found:", name)
 
 
-@njit
+@nb.jit(nopython=True, cache=True)
 def bind_lighting(pid, flags, light, shadow_map, light_matrix, ambient_light, gl):
     n = len(light)
     set_uniform_3fv(pid, "ambient_light", ambient_light, gl)
@@ -181,24 +181,29 @@ def bind_lighting(pid, flags, light, shadow_map, light_matrix, ambient_light, gl
     return active_texture
 
 
-@intrinsic
+@nb.extending.intrinsic
 def address_to_ptr(typingctx, src):
     """returns a void pointer from a given memory address"""
-    from numba.core import types, cgutils
-
-    sig = types.voidptr(src)
+    sig = nb.core.types.voidptr(src)
 
     def codegen(cgctx, builder, sig, args):
-        return builder.inttoptr(args[0], cgutils.voidptr_t)
+        return builder.inttoptr(args[0], nb.core.cgutils.voidptr_t)
 
     return sig, codegen
 
 
 class JITRenderer:
     def __init__(self, scene, node_list, primitive_list):
+        self._forward_pass = None
+        self._shadow_mapping_pass = None
+        self._point_shadow_mapping_pass = None
+        self._read_depth_buf = None
+        self._read_color_buf = None
+        self._update_normal_flat = None
+        self._update_normal_smooth = None
+        self._update_buffer = None
         self.set_primitive(scene, node_list, primitive_list)
         self.set_light(scene, scene.light_nodes, scene.ambient_light)
-        self.gen_func_ptr()
         self.reflection_mat = np.identity(4, np.float32)
 
     def update(self, scene):
@@ -219,7 +224,7 @@ class JITRenderer:
                 self.pose[i] = scene.get_pose(node)
 
         # TODO: update lights
-        self.set_light(scene, scene.light_nodes, scene.ambient_light)
+        return self.set_light(scene, scene.light_nodes, scene.ambient_light)
 
     def set_light(self, scene, light_nodes, ambient_light):
         self.light_list = light_nodes
@@ -236,6 +241,8 @@ class JITRenderer:
 
         self.ambient_light = np.array(ambient_light, np.float32)
 
+        all_textures_ready = True
+
         for i, node in enumerate(light_nodes):
             light = node.light
             pose = scene.get_pose(node)
@@ -249,7 +256,10 @@ class JITRenderer:
                 self.light[i, 7] = 0
 
                 if light.shadow_texture:
-                    self.shadow_map[i] = light.shadow_texture._texid
+                    if light.shadow_texture._in_context():
+                        self.shadow_map[i] = light.shadow_texture._texid
+                    else:
+                        all_textures_ready = False
 
                 pose = pose.copy()
                 camera = light._get_shadow_camera(scene.scale)
@@ -266,7 +276,10 @@ class JITRenderer:
                 self.light[i, 7] = 1
 
                 if light.shadow_texture:
-                    self.shadow_map[i] = light.shadow_texture._texid
+                    if light.shadow_texture._in_context():
+                        self.shadow_map[i] = light.shadow_texture._texid
+                    else:
+                        all_textures_ready = False
 
                 camera = light._get_shadow_camera(scene.scale)
                 projection = camera.get_projection_matrix()
@@ -274,6 +287,8 @@ class JITRenderer:
                 self.light_matrix[i] = projection @ view
             else:
                 raise TypeError("Light type not supported yet.")
+
+        return all_textures_ready
 
     def set_primitive(self, scene, node_list, primitive_list):
         self.node_list = node_list
@@ -287,15 +302,19 @@ class JITRenderer:
         self.pbr_mat = np.zeros((n, 9), np.float32)  # base_color <- 4, metallic <- 1, roughness <- 1, emissive <- 3
         self.spec_mat = np.zeros((n, 11), np.float32)  # diffuse <- 4, specular <- 3, glossiness <- 1, emissive <- 3
         self.render_flags = np.zeros(
-            (n, 6), np.int8
-        )  # (blend, wireframe, double sided, pbr texture, reflective floor, transparent)
+            (n, 8), np.int8
+        )  # (blend, wireframe, double sided, pbr texture, reflective floor, transparent, marker, env shared)
         self.mode = np.zeros(n, np.int32)
         self.n_instances = np.zeros(n, np.int32)
         self.n_indices = np.zeros(n, np.int32)  # positive: indices, negative: positions
+        self.model_buffer_id = np.zeros(n, np.int32)
+        self.inst_attr_start = np.zeros(n, np.int32)
 
         floor_existed = False
 
         for i, primitive in enumerate(primitive_list):
+            if primitive._vaid is None:
+                primitive._add_to_context()
             self.vao_id[i] = primitive._vaid
             self.pose[i] = scene.get_pose(node_list[i])
 
@@ -334,6 +353,8 @@ class JITRenderer:
             self.render_flags[i, 3] = isinstance(material, MetallicRoughnessMaterial)
             self.render_flags[i, 4] = primitive.is_floor and not floor_existed
             self.render_flags[i, 5] = node_list[i].mesh.is_transparent
+            self.render_flags[i, 6] = node_list[i].mesh.is_marker
+            self.render_flags[i, 7] = primitive.env_shared
 
             if primitive.is_floor:
                 floor_existed = True
@@ -341,6 +362,8 @@ class JITRenderer:
             self.mode[i] = primitive.mode
             self.n_instances[i] = len(primitive.poses) if primitive.poses is not None else 1
             self.n_indices[i] = primitive.indices.size if primitive.indices is not None else -len(primitive.positions)
+            self.model_buffer_id[i] = primitive._buffers.get("model", 0)
+            self.inst_attr_start[i] = getattr(primitive, "_inst_attr_start", 0)
 
     def load_programs(self, renderer, flags, program_flags):
         if (flags, program_flags) not in self.program_id:
@@ -353,30 +376,35 @@ class JITRenderer:
     def gen_func_ptr(self):
         self.gl = GLWrapper()
 
-        @njit(
-            none(
-                int32[:],
-                int32[:],
-                float32[:, :, :],
-                int32[:, :],
-                float32[:, :],
-                float32[:, :],
-                int8[:, :],
-                int32[:],
-                int32[:],
-                int32[:],
-                float32[:, :],
-                int32[:],
-                float32[:, :, :, :],
-                float32[:],
-                float32[:, :],
-                float32[:, :],
-                float32[:],
-                int32,
-                float32[:, :],
-                float32[:, :],
-                int32,
-                float32[:],
+        IS_OPENGL_42_AVAILABLE = hasattr(self.gl.wrapper_instance, "glDrawElementsInstancedBaseInstance")
+
+        @nb.jit(
+            nb.none(
+                nb.int32[:],
+                nb.int32[:],
+                nb.float32[:, :, :],
+                nb.int32[:, :],
+                nb.float32[:, :],
+                nb.float32[:, :],
+                nb.int8[:, :],
+                nb.int32[:],
+                nb.int32[:],
+                nb.int32[:],
+                nb.float32[:, :],
+                nb.int32[:],
+                nb.float32[:, :, :, :],
+                nb.float32[:],
+                nb.float32[:, :],
+                nb.float32[:, :],
+                nb.float32[:],
+                nb.int32,
+                nb.float32[:, :],
+                nb.float32[:, :],
+                nb.int32,
+                nb.float32[:],
+                nb.int32,
+                nb.int32[:],
+                nb.int32[:],
                 self.gl.wrapper_type,
             ),
             cache=True,
@@ -404,8 +432,13 @@ class JITRenderer:
             reflection_mat,
             floor_tex,
             screen_size,
+            env_idx,
+            model_buffer_id,
+            inst_attr_start,
             gl,
         ):
+            is_rgba = not (flags & RenderFlags_DEPTH_ONLY or flags & RenderFlags_SEG)
+
             det_reflection = np.linalg.det(reflection_mat)
             last_pid = -1
             lighting_texture = 0
@@ -413,12 +446,17 @@ class JITRenderer:
             trans_idx = [i for i in range(len(vao_id)) if render_flags[i, 5]]
             idx = solid_idx + trans_idx
             for id in idx:
-                if render_flags[id, 4] and (flags & RenderFlags_SKIP_FLOOR):
+                # Only render markers on the main graphical window, while skipping plane-reflection
+                if ((render_flags[id, 4] or render_flags[id, 6]) and flags & RenderFlags_SKIP_FLOOR) or (
+                    render_flags[id, 6]
+                    and (not is_rgba or (flags & RenderFlags_OFFSCREEN and _DISABLE_OFFSCREEN_MARKERS))
+                ):
                     continue
+
                 pid = program_id[id]
                 if pid != last_pid:
                     gl.glUseProgram(pid)
-                    if not (flags & RenderFlags_DEPTH_ONLY or flags & RenderFlags_SEG or flags & RenderFlags_FLAT):
+                    if is_rgba and not flags & RenderFlags_FLAT:
                         lighting_texture = bind_lighting(pid, flags, light, shadow_map, light_matrix, ambient_light, gl)
                         set_uniform_3fv(pid, "cam_pos", cam_pos, gl)
                         set_uniform_matrix_4fv(pid, "reflection_mat", reflection_mat, gl)
@@ -430,21 +468,22 @@ class JITRenderer:
 
                 active_texture = lighting_texture
 
-                if render_flags[id, 4] and (flags & RenderFlags_REFLECTIVE_FLOOR):
-                    gl.glActiveTexture(GL_TEXTURE0 + active_texture)
-                    gl.glBindTexture(GL_TEXTURE_2D, floor_tex)
-                    set_uniform_1i(pid, "floor_tex", active_texture, gl)
-                    set_uniform_1i(pid, "floor_flag", 1, gl)
-                    set_uniform_2f(pid, "screen_size", screen_size[0], screen_size[1], gl)
-                    active_texture += 1
-                elif flags & RenderFlags_REFLECTIVE_FLOOR:
-                    set_uniform_1i(pid, "floor_tex", 0, gl)
-                    set_uniform_1i(pid, "floor_flag", 0, gl)
+                if flags & RenderFlags_REFLECTIVE_FLOOR:
+                    if render_flags[id, 4]:
+                        gl.glActiveTexture(GL_TEXTURE0 + active_texture)
+                        gl.glBindTexture(GL_TEXTURE_2D, floor_tex)
+                        set_uniform_1i(pid, "floor_tex", active_texture, gl)
+                        set_uniform_1i(pid, "floor_flag", 1, gl)
+                        set_uniform_2f(pid, "screen_size", screen_size[0], screen_size[1], gl)
+                        active_texture += 1
+                    else:
+                        set_uniform_1i(pid, "floor_tex", 0, gl)
+                        set_uniform_1i(pid, "floor_flag", 0, gl)
 
                 set_uniform_matrix_4fv(pid, "M", pose[id], gl)
                 gl.glBindVertexArray(vao_id[id])
 
-                if not (flags & RenderFlags_DEPTH_ONLY or flags & RenderFlags_SEG or flags & RenderFlags_FLAT):
+                if is_rgba and not flags & RenderFlags_FLAT:
                     tf = textures[id, 0]
                     texture_list = [
                         "normal_texture",
@@ -474,16 +513,17 @@ class JITRenderer:
                         set_uniform_3fv(pid, "material.glossiness_factor", spec_mat[id, 8:11], gl)
 
                     if render_flags[id, 0]:
+                        # FIXME: Note that enabling GL_BLEND yield non-deterministic results on Nvidia GPU.
+                        # As a result, it must only be enabled if absolutely necessary rather than systematically.
                         gl.glEnable(GL_BLEND)
                         gl.glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
                     else:
-                        gl.glEnable(GL_BLEND)
-                        gl.glBlendFunc(GL_ONE, GL_ZERO)
+                        gl.glDisable(GL_BLEND)
 
                     wf = render_flags[id, 1]
                     if flags & RenderFlags_FLIP_WIREFRAME:
                         wf = not wf
-                    if (flags & RenderFlags_ALL_WIREFRAME) or wf:
+                    if wf or flags & RenderFlags_ALL_WIREFRAME:
                         gl.glPolygonMode(GL_FRONT_AND_BACK, GL_LINE)
                     else:
                         gl.glPolygonMode(GL_FRONT_AND_BACK, GL_FILL)
@@ -495,9 +535,8 @@ class JITRenderer:
                         gl.glCullFace(GL_BACK if det_reflection > 0 else GL_FRONT)
                 else:
                     gl.glEnable(GL_CULL_FACE)
-                    gl.glEnable(GL_BLEND)
                     gl.glCullFace(GL_BACK if det_reflection > 0 else GL_FRONT)
-                    gl.glBlendFunc(GL_ONE, GL_ZERO)
+                    gl.glDisable(GL_BLEND)
                     gl.glPolygonMode(GL_FRONT_AND_BACK, GL_FILL)
 
                 gl.glDisable(GL_PROGRAM_POINT_SIZE)
@@ -508,37 +547,78 @@ class JITRenderer:
                         continue
                     set_uniform_3fv(pid, "color", color_list[id], gl)
 
-                if n_indices[id] > 0:
-                    gl.glDrawElementsInstanced(
-                        mode[id], n_indices[id], GL_UNSIGNED_INT, address_to_ptr(0), n_instances[id]
-                    )
+                if render_flags[id, 7] or env_idx == -1:
+                    if n_indices[id] > 0:
+                        gl.glDrawElementsInstanced(
+                            mode[id], n_indices[id], GL_UNSIGNED_INT, address_to_ptr(0), n_instances[id]
+                        )
+                    else:
+                        gl.glDrawArraysInstanced(mode[id], 0, -n_indices[id], n_instances[id])
+                elif IS_OPENGL_42_AVAILABLE:
+                    if n_indices[id] > 0:
+                        gl.glDrawElementsInstancedBaseInstance(
+                            mode[id], n_indices[id], GL_UNSIGNED_INT, address_to_ptr(0), 1, env_idx
+                        )
+                    else:
+                        gl.glDrawArraysInstancedBaseInstance(mode[id], 0, -n_indices[id], 1, env_idx)
                 else:
-                    gl.glDrawArraysInstanced(mode[id], 0, -n_indices[id], n_instances[id])
+                    # OpenGL 4.1 fallback: rebind instance attributes with offset
+                    gl.glBindBuffer(GL_ARRAY_BUFFER, model_buffer_id[id])
+                    for j in range(4):
+                        gl.glVertexAttribPointer(
+                            inst_attr_start[id] + j, 4, GL_FLOAT, 0, 64, address_to_ptr(env_idx * 64 + j * 16)
+                        )
+                    if n_indices[id] > 0:
+                        gl.glDrawElementsInstanced(mode[id], n_indices[id], GL_UNSIGNED_INT, address_to_ptr(0), 1)
+                    else:
+                        gl.glDrawArraysInstanced(mode[id], 0, -n_indices[id], 1)
+                    # Restore default attribute pointer (offset 0) to avoid corrupting VAO state
+                    for j in range(4):
+                        gl.glVertexAttribPointer(inst_attr_start[id] + j, 4, GL_FLOAT, 0, 64, address_to_ptr(j * 16))
 
                 gl.glBindVertexArray(0)
             gl.glUseProgram(0)
             gl.glFlush()
 
-        @njit(
-            none(
-                int32[:],
-                int32[:],
-                float32[:, :, :],
-                int32[:],
-                int32[:],
-                int32[:],
-                float32[:, :],
-                float32[:, :],
-                int8[:, :],
+        @nb.jit(
+            nb.none(
+                nb.int32[:],
+                nb.int32[:],
+                nb.float32[:, :, :],
+                nb.int32[:],
+                nb.int32[:],
+                nb.int32[:],
+                nb.float32[:, :],
+                nb.float32[:, :],
+                nb.int8[:, :],
+                nb.int32,
+                nb.int32[:],
+                nb.int32[:],
                 self.gl.wrapper_type,
             ),
             cache=True,
         )
-        def shadow_mapping_pass(vao_id, program_id, pose, mode, n_instances, n_indices, mat_V, mat_P, render_flags, gl):
+        def shadow_mapping_pass(
+            vao_id,
+            program_id,
+            pose,
+            mode,
+            n_instances,
+            n_indices,
+            mat_V,
+            mat_P,
+            render_flags,
+            env_idx,
+            model_buffer_id,
+            inst_attr_start,
+            gl,
+        ):
             last_pid = -1
             for id in range(len(vao_id)):
-                if render_flags[id, 5]:
+                # Do not render shadows for markers and transparent objects
+                if render_flags[id, 5] or render_flags[id, 6]:
                     continue
+
                 pid = program_id[id]
                 if pid != last_pid:
                     gl.glUseProgram(pid)
@@ -552,46 +632,83 @@ class JITRenderer:
                 gl.glBindVertexArray(vao_id[id])
 
                 gl.glEnable(GL_CULL_FACE)
-                gl.glEnable(GL_BLEND)
                 gl.glCullFace(GL_BACK)
-                gl.glBlendFunc(GL_ONE, GL_ZERO)
+                gl.glDisable(GL_BLEND)
                 gl.glPolygonMode(GL_FRONT_AND_BACK, GL_FILL)
 
                 gl.glDisable(GL_PROGRAM_POINT_SIZE)
 
-                if n_indices[id] > 0:
-                    gl.glDrawElementsInstanced(
-                        mode[id], n_indices[id], GL_UNSIGNED_INT, address_to_ptr(0), n_instances[id]
-                    )
+                if render_flags[id, 7] or env_idx == -1:
+                    if n_indices[id] > 0:
+                        gl.glDrawElementsInstanced(
+                            mode[id], n_indices[id], GL_UNSIGNED_INT, address_to_ptr(0), n_instances[id]
+                        )
+                    else:
+                        gl.glDrawArraysInstanced(mode[id], 0, -n_indices[id], n_instances[id])
+                elif IS_OPENGL_42_AVAILABLE:
+                    if n_indices[id] > 0:
+                        gl.glDrawElementsInstancedBaseInstance(
+                            mode[id], n_indices[id], GL_UNSIGNED_INT, address_to_ptr(0), 1, env_idx
+                        )
+                    else:
+                        gl.glDrawArraysInstancedBaseInstance(mode[id], 0, -n_indices[id], 1, env_idx)
                 else:
-                    gl.glDrawArraysInstanced(mode[id], 0, -n_indices[id], n_instances[id])
+                    gl.glBindBuffer(GL_ARRAY_BUFFER, model_buffer_id[id])
+                    for j in range(4):
+                        gl.glVertexAttribPointer(
+                            inst_attr_start[id] + j, 4, GL_FLOAT, 0, 64, address_to_ptr(env_idx * 64 + j * 16)
+                        )
+                    if n_indices[id] > 0:
+                        gl.glDrawElementsInstanced(mode[id], n_indices[id], GL_UNSIGNED_INT, address_to_ptr(0), 1)
+                    else:
+                        gl.glDrawArraysInstanced(mode[id], 0, -n_indices[id], 1)
+                    # Restore default attribute pointer (offset 0) to avoid corrupting VAO state
+                    for j in range(4):
+                        gl.glVertexAttribPointer(inst_attr_start[id] + j, 4, GL_FLOAT, 0, 64, address_to_ptr(j * 16))
 
                 gl.glBindVertexArray(0)
             gl.glUseProgram(0)
             gl.glFlush()
 
-        @njit(
-            none(
-                int32[:],
-                int32[:],
-                float32[:, :, :],
-                int32[:],
-                int32[:],
-                int32[:],
-                float32[:, :, :],
-                float32[:],
-                int8[:, :],
+        @nb.jit(
+            nb.none(
+                nb.int32[:],
+                nb.int32[:],
+                nb.float32[:, :, :],
+                nb.int32[:],
+                nb.int32[:],
+                nb.int32[:],
+                nb.float32[:, :, :],
+                nb.float32[:],
+                nb.int8[:, :],
+                nb.int32,
+                nb.int32[:],
+                nb.int32[:],
                 self.gl.wrapper_type,
             ),
             cache=True,
         )
         def point_shadow_mapping_pass(
-            vao_id, program_id, pose, mode, n_instances, n_indices, light_matrix, light_pos, render_flags, gl
+            vao_id,
+            program_id,
+            pose,
+            mode,
+            n_instances,
+            n_indices,
+            light_matrix,
+            light_pos,
+            render_flags,
+            env_idx,
+            model_buffer_id,
+            inst_attr_start,
+            gl,
         ):
             last_pid = -1
             for id in range(len(vao_id)):
-                if render_flags[id, 5]:
+                # Do not render shadows for markers and transparent objects
+                if render_flags[id, 5] or render_flags[id, 6]:
                     continue
+
                 pid = program_id[id]
                 if pid != last_pid:
                     gl.glUseProgram(pid)
@@ -606,25 +723,45 @@ class JITRenderer:
                 gl.glBindVertexArray(vao_id[id])
 
                 gl.glEnable(GL_CULL_FACE)
-                gl.glEnable(GL_BLEND)
                 gl.glCullFace(GL_BACK)
-                gl.glBlendFunc(GL_ONE, GL_ZERO)
+                gl.glDisable(GL_BLEND)
                 gl.glPolygonMode(GL_FRONT_AND_BACK, GL_FILL)
 
                 gl.glDisable(GL_PROGRAM_POINT_SIZE)
 
-                if n_indices[id] > 0:
-                    gl.glDrawElementsInstanced(
-                        mode[id], n_indices[id], GL_UNSIGNED_INT, address_to_ptr(0), n_instances[id]
-                    )
+                if render_flags[id, 7] or env_idx == -1:
+                    if n_indices[id] > 0:
+                        gl.glDrawElementsInstanced(
+                            mode[id], n_indices[id], GL_UNSIGNED_INT, address_to_ptr(0), n_instances[id]
+                        )
+                    else:
+                        gl.glDrawArraysInstanced(mode[id], 0, -n_indices[id], n_instances[id])
+                elif IS_OPENGL_42_AVAILABLE:
+                    if n_indices[id] > 0:
+                        gl.glDrawElementsInstancedBaseInstance(
+                            mode[id], n_indices[id], GL_UNSIGNED_INT, address_to_ptr(0), 1, env_idx
+                        )
+                    else:
+                        gl.glDrawArraysInstancedBaseInstance(mode[id], 0, -n_indices[id], 1, env_idx)
                 else:
-                    gl.glDrawArraysInstanced(mode[id], 0, -n_indices[id], n_instances[id])
+                    gl.glBindBuffer(GL_ARRAY_BUFFER, model_buffer_id[id])
+                    for j in range(4):
+                        gl.glVertexAttribPointer(
+                            inst_attr_start[id] + j, 4, GL_FLOAT, 0, 64, address_to_ptr(env_idx * 64 + j * 16)
+                        )
+                    if n_indices[id] > 0:
+                        gl.glDrawElementsInstanced(mode[id], n_indices[id], GL_UNSIGNED_INT, address_to_ptr(0), 1)
+                    else:
+                        gl.glDrawArraysInstanced(mode[id], 0, -n_indices[id], 1)
+                    # Restore default attribute pointer (offset 0) to avoid corrupting VAO state
+                    for j in range(4):
+                        gl.glVertexAttribPointer(inst_attr_start[id] + j, 4, GL_FLOAT, 0, 64, address_to_ptr(j * 16))
 
                 gl.glBindVertexArray(0)
             gl.glUseProgram(0)
             gl.glFlush()
 
-        @njit(float32[:, :](int32, int32, float32, float32, self.gl.wrapper_type), cache=True)
+        @nb.jit(nb.float32[:, :](nb.int32, nb.int32, nb.float32, nb.float32, self.gl.wrapper_type), cache=True)
         def read_depth_buf(width, height, z_near, z_far, gl):
             buf = np.zeros((height, width), np.float32)
             gl.glReadPixels(0, 0, width, height, GL_DEPTH_COMPONENT, GL_FLOAT, address_to_ptr(buf.ctypes.data))
@@ -635,7 +772,7 @@ class JITRenderer:
                 depth_im = (z_near * z_far) / (z_far + z_near - depth_im * (z_far - z_near)) * 2
             return depth_im
 
-        @njit(uint8[:, :, :](int32, int32, int32, self.gl.wrapper_type), cache=True)
+        @nb.jit(nb.uint8[:, :, :](nb.int32, nb.int32, nb.int32, self.gl.wrapper_type), cache=True)
         def read_color_buf(width, height, rgba, gl):
             if rgba:
                 buf = np.zeros((height, width, 4), np.uint8)
@@ -645,7 +782,7 @@ class JITRenderer:
                 gl.glReadPixels(0, 0, width, height, GL_RGB, GL_UNSIGNED_BYTE, address_to_ptr(buf.ctypes.data))
             return buf[::-1, :, :]
 
-        @njit(float32[:, :](float32[:, :, :]), cache=True)
+        @nb.jit(nb.float32[:, :](nb.float32[:, :, :]), cache=True)
         def update_normal_flat(p):
             face_normal = np.cross(p[:, 1] - p[:, 0], p[:, 2] - p[:, 0])
             vertex_normal = np.zeros((p.shape[0] * 3, 3), p.dtype)
@@ -657,7 +794,7 @@ class JITRenderer:
                 vertex_normal[f * 3 + 2] = n
             return vertex_normal
 
-        @njit(float32[:, :](float32[:, :], int32[:, :]), cache=True)
+        @nb.jit(nb.float32[:, :](nb.float32[:, :], nb.int32[:, :]), cache=True)
         def update_normal_smooth(p, idx):
             face_normal = np.cross(p[idx[:, 1]] - p[idx[:, 0]], p[idx[:, 2]] - p[idx[:, 0]])
             vertex_normal = np.zeros_like(p)
@@ -669,7 +806,7 @@ class JITRenderer:
                 vertex_normal[v] /= np.linalg.norm(vertex_normal[v])
             return vertex_normal
 
-        @njit(none(int64[:, :], self.gl.wrapper_type), cache=True)
+        @nb.jit(nb.none(nb.int64[:, :], self.gl.wrapper_type), cache=True)
         def update_buffer(updates, gl):
             for i in range(updates.shape[0]):
                 buffer_id = updates[i, 0]
@@ -704,93 +841,85 @@ class JITRenderer:
         color_list=None,
         reflection_mat=np.identity(4, np.float32),
         floor_tex=0,
+        env_idx=-1,
     ):
         self.load_programs(renderer, flags, program_flags)
-        func = self._forward_pass
-        # timer = time()
-        if flags & RenderFlags.SEG:
-            func(
-                self.vao_id,
-                self.program_id[(flags, program_flags)],
-                self.pose,
-                self.textures,
-                self.pbr_mat,
-                self.spec_mat,
-                self.render_flags,
-                self.mode,
-                self.n_instances,
-                self.n_indices,
-                self.light,
-                self.shadow_map,
-                self.light_matrix,
-                self.ambient_light,
-                V.astype(np.float32),
-                P.astype(np.float32),
-                cam_pos.astype(np.float32),
-                flags,
-                color_list,
-                reflection_mat,
-                floor_tex,
-                screen_size,
-                self.gl.wrapper_instance,
-            )
-        else:
-            func(
-                self.vao_id,
-                self.program_id[(flags, program_flags)],
-                self.pose,
-                self.textures,
-                self.pbr_mat,
-                self.spec_mat,
-                self.render_flags,
-                self.mode,
-                self.n_instances,
-                self.n_indices,
-                self.light,
-                self.shadow_map,
-                self.light_matrix,
-                self.ambient_light,
-                V.astype(np.float32),
-                P.astype(np.float32),
-                cam_pos.astype(np.float32),
-                flags,
-                self.pbr_mat,
-                reflection_mat,
-                floor_tex,
-                screen_size,
-                self.gl.wrapper_instance,
-            )
-        # print(100.0/(time()-timer))
+        if self._forward_pass is None:
+            self.gen_func_ptr()
+        # Temporarily hide markers for non-debug offscreen cameras by setting their
+        # index count to 0, so draw calls render nothing for these nodes.
+        if flags & RenderFlags.SKIP_MARKERS:
+            marker_mask = self.render_flags[:, 6].astype(bool)
+            saved_n_indices = self.n_indices[marker_mask].copy()
+            self.n_indices[marker_mask] = 0
+        self._forward_pass(
+            self.vao_id,
+            self.program_id[(flags, program_flags)],
+            self.pose,
+            self.textures,
+            self.pbr_mat,
+            self.spec_mat,
+            self.render_flags,
+            self.mode,
+            self.n_instances,
+            self.n_indices,
+            self.light,
+            self.shadow_map,
+            self.light_matrix,
+            self.ambient_light,
+            np.ascontiguousarray(V, dtype=np.float32),
+            np.ascontiguousarray(P, dtype=np.float32),
+            np.ascontiguousarray(cam_pos, dtype=np.float32),
+            flags,
+            color_list if flags & RenderFlags.SEG else self.pbr_mat,
+            reflection_mat,
+            floor_tex,
+            screen_size,
+            env_idx,
+            self.model_buffer_id,
+            self.inst_attr_start,
+            self.gl.wrapper_instance,
+        )
+        if flags & RenderFlags.SKIP_MARKERS:
+            self.n_indices[marker_mask] = saved_n_indices
 
-    def shadow_mapping_pass(self, renderer, V, P, flags, program_flags):
+    def shadow_mapping_pass(self, renderer, V, P, flags, program_flags, env_idx=-1):
         self.load_programs(renderer, flags, program_flags)
-        func = self._shadow_mapping_pass
-        func(
+        if self._shadow_mapping_pass is None:
+            self.gen_func_ptr()
+        self._shadow_mapping_pass(
             self.vao_id,
             self.program_id[(flags, program_flags)],
             self.pose,
             self.mode,
             self.n_instances,
             self.n_indices,
-            V.astype(np.float32),
-            P.astype(np.float32),
+            np.ascontiguousarray(V, dtype=np.float32),
+            np.ascontiguousarray(P, dtype=np.float32),
             self.render_flags,
+            env_idx,
+            self.model_buffer_id,
+            self.inst_attr_start,
             self.gl.wrapper_instance,
         )
 
-    def point_shadow_mapping_pass(self, renderer, light_matrix, light_pos, flags, program_flags):
+    def point_shadow_mapping_pass(self, renderer, light_matrix, light_pos, flags, program_flags, env_idx=-1):
         self.load_programs(renderer, flags, program_flags)
-        func = self._point_shadow_mapping_pass
-        func(
+        if self._point_shadow_mapping_pass is None:
+            self.gen_func_ptr()
+        self._point_shadow_mapping_pass(
             self.vao_id,
             self.program_id[(flags, program_flags)],
             self.pose,
             self.mode,
             self.n_instances,
             self.n_indices,
-            light_matrix.astype(np.float32),
-            light_pos.astype(np.float32),
+            np.ascontiguousarray(light_matrix, dtype=np.float32),
+            np.ascontiguousarray(light_pos, dtype=np.float32),
             self.render_flags,
+            env_idx,
+            self.model_buffer_id,
+            self.inst_attr_start,
             self.gl.wrapper_instance,
         )
 
@@ -798,26 +927,41 @@ class JITRenderer:
         primitive = node.mesh.primitives[0]
         if primitive.normals is None:
             return None
+        vertices = np.ascontiguousarray(vertices, dtype=np.float32)
         if primitive.indices is not None:
+            if self._update_normal_smooth is None:
+                self.gen_func_ptr()
             return self._update_normal_smooth(vertices, primitive.indices)
         else:
+            if self._update_normal_flat is None:
+                self.gen_func_ptr()
             return self._update_normal_flat(vertices.reshape((-1, 3, 3)))
 
     def update_buffer(self, buffer_updates):
+        # Early return if nothing to do
+        if not buffer_updates:
+            return
+
         updates = np.zeros((len(buffer_updates), 3), dtype=np.int64)
-        flattened_list = []
+        buffers = []
         for idx, (id, data) in enumerate(buffer_updates.items()):
-            flattened = np.ascontiguousarray(data.flatten().astype(np.float32))
-            flattened_list.append(flattened)
+            buffer = np.ascontiguousarray(data, dtype=np.float32)
+            buffers.append(buffer)
 
             updates[idx, 0] = id
-            updates[idx, 1] = 4 * len(flattened)
-            updates[idx, 2] = flattened.ctypes.data
+            updates[idx, 1] = 4 * buffer.size
+            updates[idx, 2] = buffer.ctypes.data
 
+        if self._update_buffer is None:
+            self.gen_func_ptr()
         self._update_buffer(updates, self.gl.wrapper_instance)
 
     def read_depth_buf(self, weight, height, z_near, z_far):
+        if self._read_depth_buf is None:
+            self.gen_func_ptr()
         return self._read_depth_buf(weight, height, z_near, z_far, self.gl.wrapper_instance)
 
     def read_color_buf(self, weight, height, rgba):
+        if self._read_color_buf is None:
+            self.gen_func_ptr()
         return self._read_color_buf(weight, height, rgba, self.gl.wrapper_instance)

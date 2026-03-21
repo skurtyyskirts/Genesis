@@ -5,8 +5,9 @@ Author: Matthew Matl
 """
 
 import abc
+from abc import ABCMeta
+
 import numpy as np
-import six
 
 from OpenGL.GL import *
 
@@ -16,8 +17,7 @@ from .constants import SHADOW_TEX_SZ
 from .camera import OrthographicCamera, PerspectiveCamera
 
 
-@six.add_metaclass(abc.ABCMeta)
-class Light(object):
+class Light(metaclass=ABCMeta):
     """Base class for all light objects.
 
     Parameters
@@ -33,7 +33,6 @@ class Light(object):
     """
 
     def __init__(self, color=None, intensity=None, name=None):
-
         if color is None:
             color = np.ones(3)
         if intensity is None:
@@ -135,11 +134,7 @@ class DirectionalLight(Light):
     """
 
     def __init__(self, color=None, intensity=None, name=None):
-        super(DirectionalLight, self).__init__(
-            color=color,
-            intensity=intensity,
-            name=name,
-        )
+        super().__init__(color=color, intensity=intensity, name=name)
 
     def _generate_shadow_texture(self, size=None):
         """Generate a shadow texture for this light.
@@ -166,6 +161,8 @@ class DirectionalLight(Light):
         camera : :class:`.Camera`
             The camera used to render shadowmaps for this light.
         """
+        if scene_scale < 1e-6:
+            scene_scale = 1.0
         return OrthographicCamera(znear=0.01 * scene_scale, zfar=10 * scene_scale, xmag=scene_scale, ymag=scene_scale)
 
 
@@ -191,11 +188,7 @@ class PointLight(Light):
     """
 
     def __init__(self, color=None, intensity=None, range=None, name=None):
-        super(PointLight, self).__init__(
-            color=color,
-            intensity=intensity,
-            name=name,
-        )
+        super().__init__(color=color, intensity=intensity, name=name)
         self.range = range
 
     @property
@@ -306,11 +299,7 @@ class SpotLight(Light):
     def __init__(
         self, color=None, intensity=None, range=None, innerConeAngle=0.0, outerConeAngle=(np.pi / 4.0), name=None
     ):
-        super(SpotLight, self).__init__(
-            name=name,
-            color=color,
-            intensity=intensity,
-        )
+        super().__init__(name=name, color=color, intensity=intensity)
         self.outerConeAngle = outerConeAngle
         self.innerConeAngle = innerConeAngle
         self.range = range

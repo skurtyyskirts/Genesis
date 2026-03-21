@@ -1,42 +1,32 @@
+import ctypes
 import os
 import pickle as pkl
+import platform
 import subprocess
 import sys
+import shutil
 import tempfile
+from multiprocessing import Process, Queue
 
 import igl
 import numpy as np
-import vtk
-from vtk.util.numpy_support import vtk_to_numpy
+import trimesh
 
 import genesis as gs
-from genesis.ext import trimesh
 
 from . import geom as gu
 from . import mesh as msu
 from . import misc as miu
 
-# misc operations for external binary
-# ParticleMesherPy
-try:
-    LD_LIBRARY_PATH = os.path.join(miu.get_src_dir(), "ext/ParticleMesher/ParticleMesherPy")
-    sys.path.append(LD_LIBRARY_PATH)
-    cur_ld_library_path = os.environ.get("LD_LIBRARY_PATH", "")
-    os.environ["LD_LIBRARY_PATH"] = f"{cur_ld_library_path}:{LD_LIBRARY_PATH}"
-    import ParticleMesherPy
+# Make sure ParticleMesherPy shared libary can be found in search path
+LD_LIBRARY_PATH = os.path.join(miu.get_src_dir(), "ext/ParticleMesher/ParticleMesherPy")
+sys.path.append(LD_LIBRARY_PATH)
+os.environ["LD_LIBRARY_PATH"] = ":".join(filter(None, (os.environ.get("LD_LIBRARY_PATH"), LD_LIBRARY_PATH)))
 
-    is_ParticleMesherPy_available = True
-except Exception as e:
-    ParticleMesherPy_error_msg = f"{e.__class__.__name__}: {e}"
-    is_ParticleMesherPy_available = False
-
-# splashsurf
 try:
-    subprocess.run(["splashsurf"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    is_splashsurf_available = True
-except Exception as e:
-    splashsurf_error_msg = f"{e.__class__.__name__}: {e}"
-    is_splashsurf_available = False
+    malloc_trim = ctypes.CDLL(ctypes.util.find_library("c")).malloc_trim
+except (AttributeError, TypeError):
+    malloc_trim = None
 
 
 def n_particles_vol(p_size=0.01, volume=1.0):
@@ -52,32 +42,42 @@ def n_particles_1D(p_size=0.01, length=1.0):
 
 
 def nowhere_particles(n):
-    positions = np.tile(gu.nowhere(), [n, 1])
-    return positions
+    return np.tile(gu.nowhere(), (n, 1))
 
 
 def trimesh_to_particles_simple(mesh, p_size, sampler):
     """
     Mesh to particles via `random` or `regular` sampler.
     """
-    assert sampler in ["random", "regular"]
+    assert sampler in ("random", "regular")
+
+    # compute file name via hashing for caching
     ptc_file_path = msu.get_ptc_path(mesh.vertices, mesh.faces, p_size, sampler)
 
-    if not os.path.exists(ptc_file_path):
+    # loading pre-computed cache if available
+    is_cached_loaded = False
+    if os.path.exists(ptc_file_path):
+        gs.logger.debug("Sampled particles file (`.ptc`) found in cache.")
+        try:
+            with open(ptc_file_path, "rb") as file:
+                positions = pkl.load(file)
+            is_cached_loaded = True
+        except (EOFError, ModuleNotFoundError, pkl.UnpicklingError, TypeError, MemoryError):
+            gs.logger.info("Ignoring corrupted cache.")
+
+    if not is_cached_loaded:
         with gs.logger.timer(f"Sampling particles with ~<{sampler}>~ sampler and generating `.ptc` file:"):
             # sample a cube first
             box_size = mesh.bounds[1] - mesh.bounds[0]
             box_center = (mesh.bounds[1] + mesh.bounds[0]) / 2
             positions = _box_to_particles(p_size=p_size, pos=box_center, size=box_size, sampler=sampler)
             # reject out-of-boundary particles
-            positions = positions[igl.signed_distance(positions, mesh.vertices, mesh.faces)[0] < 0]
+            sd, *_ = igl.signed_distance(positions, mesh.vertices, mesh.faces)
+            positions = positions[sd < 0.0]
 
             os.makedirs(os.path.dirname(ptc_file_path), exist_ok=True)
-            pkl.dump(positions, open(ptc_file_path, "wb"))
-
-    else:
-        gs.logger.debug("Sampled particles (`.ptc`) found in cache.")
-        positions = pkl.load(open(ptc_file_path, "rb"))
+            with open(ptc_file_path, "wb") as file:
+                pkl.dump(positions, file)
 
     return positions
 
@@ -85,13 +85,29 @@ def trimesh_to_particles_simple(mesh, p_size, sampler):
 def trimesh_to_particles_pbs(mesh, p_size, sampler, pos=(0, 0, 0)):
     """
     Physics-based particle sampler using the method proposed by Kugelstadt et al. [2021].
+
     References: https://splishsplash.readthedocs.io/en/latest/VolumeSampling.html
-    If this sampler fails, it returns `None`.
     """
     assert "pbs" in sampler
+
+    if not (sys.platform == "linux" and platform.machine() == "x86_64"):
+        gs.raise_exception(f"Physics-based particle sampler '{sampler}' is only supported on Linux x86.")
+
+    # compute file name via hashing for caching
     ptc_file_path = msu.get_ptc_path(mesh.vertices, mesh.faces, p_size, sampler)
 
-    if not os.path.exists(ptc_file_path):
+    # loading pre-computed cache if available
+    is_cached_loaded = False
+    if os.path.exists(ptc_file_path):
+        gs.logger.debug("Sampled particles file (`.ptc`) found in cache.")
+        try:
+            with open(ptc_file_path, "rb") as file:
+                positions = pkl.load(file)
+            is_cached_loaded = True
+        except (EOFError, ModuleNotFoundError, pkl.UnpicklingError, TypeError, MemoryError):
+            gs.logger.info("Ignoring corrupted cache.")
+
+    if not is_cached_loaded:
         with gs.logger.timer(f"Sampling particles with ~<{sampler}>~ sampler and generating `.ptc` file:"):
             sdf_res = int(sampler.split("-")[-1])
 
@@ -99,49 +115,64 @@ def trimesh_to_particles_pbs(mesh, p_size, sampler, pos=(0, 0, 0)):
             scale = 1.104  # Magic number from Pingchuan Ma.
             particle_radius = p_size * scale / 2
 
-            _, tmp_mesh_path = tempfile.mkstemp()
-            _, tmp_vtk_path = tempfile.mkstemp()
-            tmp_mesh_path += ".obj"
-            tmp_vtk_path += ".vtk"
-            mesh.export(tmp_mesh_path)
+            fd, mesh_path = tempfile.mkstemp(suffix=".obj")
+            os.close(fd)
+            fd, vtk_path = tempfile.mkstemp(suffix=".vtk")
+            os.close(fd)
+            mesh.export(mesh_path)
 
-            # Sample particles
-            steps = 100  # use bigger value leads to smoother surface
-            command = (
-                os.path.join(miu.get_src_dir(), "ext/VolumeSampling")
-                + f" -i {tmp_mesh_path} -o {tmp_vtk_path} --no-cache --mode 4 -r {particle_radius:.6f} --res {sdf_res},{sdf_res},{sdf_res} --steps {steps}"
-            )
-            process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            stdout, _ = process.communicate()
-            if not os.path.isfile(tmp_vtk_path):
-                return None
+            try:
+                # Try importing VTK. It would fail on Linux if not graphic server is running.
+                import vtk
+                from vtk.util.numpy_support import vtk_to_numpy
 
-            # Print sampler output
-            stdout_str = stdout.decode("utf-8")
-            gs.logger.debug(stdout_str)
+                # Sample particles
+                command = (
+                    os.path.join(miu.get_src_dir(), "ext/VolumeSampling"),
+                    "-i",
+                    mesh_path,
+                    "-o",
+                    vtk_path,
+                    "--no-cache",
+                    "--mode",
+                    4,
+                    "-r",
+                    particle_radius,
+                    "--res",
+                    f"{sdf_res},{sdf_res},{sdf_res}",
+                    "--steps",
+                    100,  # use bigger value leads to smoother surface
+                )
+                result = subprocess.run(map(str, command), capture_output=True, text=True)
+                if result.stdout:
+                    gs.logger.debug(result.stdout)
+                if result.stderr:
+                    gs.logger.warning(result.stderr)
+                if os.path.getsize(vtk_path) == 0:
+                    raise OSError("Output VTK file is empty.")
 
-            # Read the generated VTK file
-            reader = vtk.vtkUnstructuredGridReader()
-            reader.SetFileName(tmp_vtk_path)
-            reader.Update()
-            positions = vtk_to_numpy(reader.GetOutput().GetPoints().GetData())
-
-            os.makedirs(os.path.dirname(ptc_file_path), exist_ok=True)
-            pkl.dump(positions, open(ptc_file_path, "wb"))
+                # Read the generated VTK file
+                reader = vtk.vtkUnstructuredGridReader()
+                reader.SetFileName(vtk_path)
+                reader.Update()
+                positions = vtk_to_numpy(reader.GetOutput().GetPoints().GetData())
+            except (OSError, ImportError) as e:
+                gs.raise_exception_from(f"Physics-based particle sampler '{sampler}' failed.", e)
+            finally:
+                os.remove(mesh_path)
+                os.remove(vtk_path)
 
             # Clean up the intermediate files
             output_dir = os.path.join(miu.get_src_dir(), "ext/output")
             if os.path.exists(output_dir):
-                process = subprocess.Popen(
-                    f"rm -rf {output_dir}", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-                )
-                process.communicate()
+                shutil.rmtree(output_dir, ignore_errors=True)
 
-    else:
-        gs.logger.debug("Sampled particles (`.ptc`) found in cache.")
-        positions = pkl.load(open(ptc_file_path, "rb"))
+            # Cache the generated positions
+            os.makedirs(os.path.dirname(ptc_file_path), exist_ok=True)
+            with open(ptc_file_path, "wb") as file:
+                pkl.dump(positions, file)
 
-    positions += np.array(pos)
+    positions += np.asarray(pos)
 
     return positions
 
@@ -181,12 +212,12 @@ def box_to_particles(p_size=0.01, pos=(0, 0, 0), size=(1, 1, 1), sampler="random
     if "pbs" in sampler:
         mesh = trimesh.creation.box(extents=size)
 
-        positions = trimesh_to_particles_pbs(mesh, p_size, sampler, pos=pos)
-        if positions is None:
-            gs.logger.warning("`pbs` sampler failed. Falling back to `random` sampler.")
+        try:
+            positions = trimesh_to_particles_pbs(mesh, p_size, sampler, pos=pos)
+        except gs.GenesisException:
             sampler = "random"
 
-    if sampler in ["random", "regular"]:
+    if sampler in ("random", "regular"):
         positions = _box_to_particles(
             p_size=p_size,
             pos=pos,
@@ -200,12 +231,12 @@ def box_to_particles(p_size=0.01, pos=(0, 0, 0), size=(1, 1, 1), sampler="random
 def cylinder_to_particles(p_size=0.01, pos=(0, 0, 0), radius=0.5, height=1.0, sampler="random"):
     if "pbs" in sampler:
         mesh = trimesh.creation.cylinder(radius=radius, height=height)
-        positions = trimesh_to_particles_pbs(mesh, p_size, sampler, pos=pos)
-        if positions is None:
-            gs.logger.warning("`pbs` sampler failed. Falling back to `random` sampler.")
+        try:
+            positions = trimesh_to_particles_pbs(mesh, p_size, sampler, pos=pos)
+        except gs.GenesisException:
             sampler = "random"
 
-    if sampler in ["random", "regular"]:
+    if sampler in ("random", "regular"):
         # sample a cube first
         size = np.array([2 * radius, 2 * radius, height])
         positions = _box_to_particles(
@@ -224,12 +255,12 @@ def cylinder_to_particles(p_size=0.01, pos=(0, 0, 0), radius=0.5, height=1.0, sa
 def sphere_to_particles(p_size=0.01, pos=(0, 0, 0), radius=0.5, sampler="random"):
     if "pbs" in sampler:
         mesh = trimesh.creation.icosphere(radius=radius)
-        positions = trimesh_to_particles_pbs(mesh, p_size, sampler, pos=pos)
-        if positions is None:
-            gs.logger.warning("`pbs` sampler failed. Falling back to `random` sampler.")
+        try:
+            positions = trimesh_to_particles_pbs(mesh, p_size, sampler, pos=pos)
+        except gs.GenesisException:
             sampler = "random"
 
-    if sampler in ["random", "regular"]:
+    if sampler in ("random", "regular"):
         # sample a cube first
         size = np.array([2 * radius, 2 * radius, 2 * radius])
         positions = _box_to_particles(
@@ -248,12 +279,12 @@ def sphere_to_particles(p_size=0.01, pos=(0, 0, 0), radius=0.5, sampler="random"
 def shell_to_particles(p_size=0.01, pos=(0, 0, 0), inner_radius=0.5, outer_radius=0.7, sampler="random"):
     if "pbs" in sampler:
         mesh = trimesh.creation.icosphere(radius=outer_radius)
-        positions = trimesh_to_particles_pbs(mesh, p_size, sampler, pos=pos)
-        if positions is None:
-            gs.logger.warning("`pbs` sampler failed. Falling back to `random` sampler.")
+        try:
+            positions = trimesh_to_particles_pbs(mesh, p_size, sampler, pos=pos)
+        except gs.GenesisException:
             sampler = "random"
 
-    if sampler in ["random", "regular"]:
+    if sampler in ("random", "regular"):
         # sample a cube first
         size = np.array([2 * outer_radius, 2 * outer_radius, 2 * outer_radius])
         positions = _box_to_particles(
@@ -273,7 +304,43 @@ def shell_to_particles(p_size=0.01, pos=(0, 0, 0), inner_radius=0.5, outer_radiu
     return positions
 
 
+def _splashsurf_worker(positions, radius, args_dict, result_queue):
+    try:
+        import pysplashsurf
+
+        mesh_with_data, _ = pysplashsurf.reconstruction_pipeline(
+            positions,
+            particle_radius=radius * args_dict.get("rscale", 1.0),
+            smoothing_length=2.0,
+            cube_size=0.8,
+            iso_surface_threshold=0.6,
+            mesh_smoothing_weights=True,
+            mesh_smoothing_iters=int(args_dict.get("smooth", 25)),
+            normals_smoothing_iters=10,
+            mesh_cleanup=True,
+            compute_normals=True,
+            multi_threading=True,
+        )
+        normals = mesh_with_data.point_attributes["normals"]
+        vertices = mesh_with_data.mesh.vertices
+        triangles = mesh_with_data.mesh.triangles
+        result_queue.put_nowait((vertices, triangles, normals))
+    except Exception as e:
+        result_queue.put_nowait(e)
+        raise
+
+
 def particles_to_mesh(positions, radius, backend):
+    def parse_args(backend):
+        args_dict = dict()
+        args_list = backend.split("-")
+        if len(args_list) >= 2:
+            args_dict["rscale"] = float(args_list[1])
+            args_list = args_list[2:]
+            for i in range(0, len(args_list), 2):
+                args_dict[args_list[i]] = float(args_list[i + 1])
+        return args_dict
+
     if positions.shape[0] == 0:
         return trimesh.Trimesh(vertices=np.zeros((0, 3)), faces=np.zeros((0, 3)))
 
@@ -281,22 +348,29 @@ def particles_to_mesh(positions, radius, backend):
         radii = radius
         radius = np.min(radius)
         if "splashsurf" in backend:
-            gs.logger.warning("Cannot use variable radius for splashsurf. Fall back to openvdb.")
+            gs.logger.warning(
+                "Backend 'splashsurf' does not support specifying individual radius for each particle. Switching to "
+                "backend 'openvdb' as a fallback."
+            )
             backend = "openvdb"
     else:
         radii = np.array([])
 
-    if backend == "openvdb":
-        radius_scale = 2.0
-        if not is_ParticleMesherPy_available:
-            gs.raise_exception(f"Failed to import ParticleMesher. {ParticleMesherPy_error_msg}")
+    args_dict = parse_args(backend)
 
+    if "openvdb" in backend:
+        if sys.platform != "linux" or sys.version_info[:2] == (3, 9):
+            gs.raise_exception("Backend 'openvdb' is only supported on Linux and Python 3.9 specifically.")
+
+        import ParticleMesherPy
+
+        radius_scale = args_dict.get("rscale", 2.0)
         reconstructor = ParticleMesherPy.MeshConstructor(
             ParticleMesherPy.MeshConstructorConfig(
                 particle_radius=radius * radius_scale,
-                voxel_scale=1.0,
-                isovalue=0.0,
-                adaptivity=0.01,
+                voxel_scale=args_dict.get("vscale", 1.0),
+                isovalue=args_dict.get("isovalue", 0.0),
+                adaptivity=args_dict.get("adaptivity", 0.01),
             )
         )
         mesh = reconstructor.construct(positions=positions, radii=radii * radius_scale)
@@ -305,44 +379,24 @@ def particles_to_mesh(positions, radius, backend):
         faces = mesh.triangles.reshape([-1, 3])
 
         return trimesh.Trimesh(vertices, faces, process=False)
-
     elif "splashsurf" in backend:
-        if not is_splashsurf_available:
-            gs.raise_exception(f"Failed to import splashsurf. {splashsurf_error_msg}")
-
-        _, tmp_xyz_path = tempfile.mkstemp()
-        os.close(_)
-        tmp_xyz_path += ".xyz"
-
-        _, tmp_obj_path = tempfile.mkstemp()
-        os.close(_)
-        tmp_obj_path += ".obj"
-
-        positions.astype(np.float32).tofile(tmp_xyz_path)
-
-        # suggested value is 1.4-1.6. 1.0 seems more detailed?
-        if len(backend.split("-")) >= 2:
-            r = radius * float(backend.split("-")[1])
+        # FIXME: Running in subprocess or manually reclaiming free-ed head memory is necessary to avoid unbounded growth
+        result_queue = Queue()
+        if malloc_trim is not None:
+            _splashsurf_worker(positions, radius, args_dict, result_queue)
+            result = result_queue.get()
+            malloc_trim(0)
         else:
-            r = radius * 1.0
-
-        if "smooth" in backend:
-            smooth_iter = int(backend.split("-")[-1])
-            command = f"splashsurf reconstruct {tmp_xyz_path} -r={r:.5f} -c=0.8 -l=2.0 -t=0.6 --subdomain-grid=on -o {tmp_obj_path} --mesh-cleanup=on --mesh-smoothing-weights=on --mesh-smoothing-iters={smooth_iter} --normals=on --normals-smoothing-iters=10"
-        else:
-            command = f"splashsurf reconstruct {tmp_xyz_path} -r={r:.5f} -c=0.8 -l=2.0 -t=0.6 --subdomain-grid=on -o {tmp_obj_path}"
-        process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        stdout, _ = process.communicate()
-
-        if not os.path.isfile(tmp_obj_path):
-            gs.raise_exception("Surface reconstruction failed.")
-
-        # gs.logger.debug(stdout.decode('utf-8'))
-
-        mesh = trimesh.load_mesh(tmp_obj_path)
+            proc = Process(target=_splashsurf_worker, args=(positions, radius, args_dict, result_queue))
+            proc.start()
+            result = result_queue.get()
+            proc.join()
+            if proc.exitcode != 0:
+                gs.raise_exception_from(f"splashsurf subprocess failed with exit code {proc.exitcode}", result)
+        vertices, triangles, normals = result
+        mesh = trimesh.Trimesh(vertices=vertices, faces=triangles, face_normals=normals, process=False)
         gs.logger.debug(f"[splashsurf]: reconstruct vertices: {mesh.vertices.shape}, {mesh.faces.shape}")
         return mesh
-
     else:
         gs.raise_exception(f"Unsupported backend: {backend}.")
 
@@ -360,8 +414,10 @@ def init_foam_generator(
     k_foam,
     foam_density,
 ):
-    if not is_ParticleMesherPy_available:
-        gs.raise_exception(f"Failed to import ParticleMesher. {ParticleMesherPy_error_msg}")
+    if sys.platform != "linux" or sys.version_info[:2] == (3, 9):
+        gs.raise_exception("This method is only supported on Linux and Python 3.9 specfically.")
+
+    import ParticleMesherPy
 
     min_ke = 0.1 * (particle_radius**3 * 6400) * (2.5**2)
     return ParticleMesherPy.FoamGenerator(
@@ -397,8 +453,10 @@ def generate_foam_particles(generator, positions, velocities):
 
 
 def filter_surface(positions, radii, particle_radius, half_width=8.0, radius_scale=1.0):
-    if not is_ParticleMesherPy_available:
-        gs.raise_exception(f"Failed to import ParticleMesher. {ParticleMesherPy_error_msg}")
+    if sys.platform != "linux" or sys.version_info[:2] == (3, 9):
+        gs.raise_exception("This method is only supported on Linux and Python 3.9 specfically.")
+
+    import ParticleMesherPy
 
     splitter = ParticleMesherPy.SurfaceSplitter(
         ParticleMesherPy.SurfaceSplitterConfig(
